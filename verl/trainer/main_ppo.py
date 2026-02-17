@@ -1,0 +1,355 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
+"""
+
+from verl import DataProto
+import torch
+import sys
+from tqdm import tqdm
+from verl.utils.reward_score import qa_em, qa_em_format, qa_em_new, qa_em_judge
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+import re
+import numpy as np
+
+def _select_rm_score_fn(data_source, reward_type='answer_correctness'):
+    if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle']:
+        if reward_type == 'answer_correctness':
+            return qa_em_new.compute_score_em
+        elif reward_type == 'answer_sub_em':
+            return qa_em_new.compute_score_subem
+        elif reward_type == 'f1_score':
+            return qa_em_new.compute_score_f1
+        elif reward_type == 'format_correctness':
+            return qa_em_new.compute_score_format
+        elif reward_type == 'retrieval_correctness':
+            return qa_em_new.compute_score_retrieval
+        elif reward_type == 'mixed_outcome_reward':
+            return qa_em_new.compute_score_em_format_retrievel
+        elif reward_type == 'final_em_format':
+            return qa_em_new.compute_score_final_em_format
+        elif reward_type == 'step_retrieval_format':
+            return qa_em_new.compute_score_step_retrieval_format
+        elif reward_type == 'judge_outcome_reward':
+            return qa_em_judge.compute_score_judge_outcome
+        elif reward_type == 'judge_turn_reward':
+            return qa_em_judge.compute_score_judge_turn
+        else:
+            raise NotImplementedError(f"Unsupported reward type: {reward_type} for data source: {data_source}")
+        
+    else:
+        raise NotImplementedError
+
+
+class RewardManager():
+    """The reward manager.
+    """
+
+    def __init__(self, tokenizer, num_examine, config, format_score=0., is_val=False) -> None:
+        self.tokenizer = tokenizer
+        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        self.format_score = format_score
+        self.config = config
+        self.is_val = is_val
+
+    def __call__(self, data: DataProto):
+        """We will expand this function gradually based on the available datasets"""
+
+        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
+        if 'rm_scores' in data.batch.keys():
+            return data.batch['rm_scores']
+        
+        reward_type = self.config.algorithm.get('reward_type', 'outcome_reward')
+
+        answer_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        answer_sub_em_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        f1_score_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        format_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        retrieval_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        mixed_outcome_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        final_em_format_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)  
+        step_retrieval_format_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        avg_step_retrieval_format_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        turn_level_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        
+        # Prepare batch data collection for judge processing if needed
+        batch_mid_turns = []
+        batch_final_turns = []
+        batch_solutions = []
+        batch_ground_truths = []
+        batch_indices = []
+        is_judge = 'judge' in reward_type and not self.is_val
+
+        already_print_data_sources = {}
+
+        for i in tqdm(range(len(data)), desc="Computing rewards", unit="items"):
+            data_item = data[i]  # DataProtoItem
+
+            prompt_ids = data_item.batch['prompts']
+
+            prompt_length = prompt_ids.shape[-1]
+
+            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = data_item.batch['responses']
+            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
+            sequences_str = self.tokenizer.decode(sequences)
+
+            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            decoded_full_texts = data_item.meta_info['decoded_full_texts'][i]
+            decoded_turn_texts = data_item.meta_info['decoded_turn_texts'][i]
+
+            # select rm_score
+            data_source = data_item.non_tensor_batch['data_source']
+            compute_answer_score = _select_rm_score_fn(data_source, reward_type='answer_correctness')
+            compute_answer_sub_em_score = _select_rm_score_fn(data_source, reward_type='answer_sub_em')
+            compute_f1_score = _select_rm_score_fn(data_source, reward_type='f1_score')
+            compute_format_score = _select_rm_score_fn(data_source, reward_type='format_correctness')
+            compute_retrieval_score = _select_rm_score_fn(data_source, reward_type='retrieval_correctness')
+            compute_mixed_outcome_score = _select_rm_score_fn(data_source, reward_type='mixed_outcome_reward')
+            compute_final_em_format_score = _select_rm_score_fn(data_source, reward_type='final_em_format')
+
+            answer_score = compute_answer_score(solution_str=sequences_str, ground_truth=ground_truth)
+            answer_sub_em_score = compute_answer_sub_em_score(solution_str=sequences_str, ground_truth=ground_truth)
+            f1_score = compute_f1_score(solution_str=sequences_str, ground_truth=ground_truth)
+            format_score = compute_format_score(solution_str=sequences_str)
+            retrieval_score = compute_retrieval_score(solution_str=sequences_str, ground_truth=ground_truth)
+            mixed_outcome_score = compute_mixed_outcome_score(solution_str=sequences_str, ground_truth=ground_truth)
+            try:
+                final_turn = decoded_turn_texts[-1]
+                if final_turn:
+                    final_em_format_score = compute_final_em_format_score(
+                        final_turn_str=final_turn,
+                        ground_truth=ground_truth
+                    )
+            except (IndexError, TypeError, KeyError) as e:
+                # Optional: log if you want debugging info
+                # print(f"[Warning] final EM-format score skipped due to: {e}")
+                final_em_format_score = 0.0
+
+            answer_reward_tensor[i, valid_response_length - 1] = answer_score
+            answer_sub_em_reward_tensor[i, valid_response_length - 1] = answer_sub_em_score
+            f1_score_reward_tensor[i, valid_response_length - 1] = f1_score
+            format_reward_tensor[i, valid_response_length - 1] = format_score
+            retrieval_reward_tensor[i, valid_response_length - 1] = retrieval_score
+            mixed_outcome_reward_tensor[i, valid_response_length - 1] = mixed_outcome_score
+            final_em_format_reward_tensor[i, valid_response_length - 1] = final_em_format_score
+
+            compute_step_retrieval_format_score = _select_rm_score_fn(data_source, reward_type='step_retrieval_format')
+            step_retrieval_format_score = compute_step_retrieval_format_score(mid_turn_str=decoded_turn_texts[:-1], ground_truth=ground_truth)
+            for j in range(data.meta_info['num_turns'][i] - 1):
+                step_retrieval_format_reward_tensor[i, data.meta_info['turn_indices'][i][j][1]] = step_retrieval_format_score[j]
+                
+            turn_level_reward_tensor = final_em_format_reward_tensor + step_retrieval_format_reward_tensor
+            
+            if data.meta_info['num_turns'][i] - 1 == 0:
+                avg_step_retrieval_format_reward_tensor[i, valid_response_length - 1] = 0
+            else:
+                avg_step_retrieval_format_reward_tensor[i, valid_response_length - 1] = step_retrieval_format_reward_tensor[i, :].sum(dim=-1) / (data.meta_info['num_turns'][i] - 1)
+            
+            # Collect batch data for judge processing if needed
+            if is_judge:
+                batch_mid_turns.append(decoded_turn_texts[:-1])
+                batch_final_turns.append(decoded_turn_texts[-1])
+                batch_solutions.append(decoded_full_texts)
+                batch_ground_truths.append(ground_truth)
+                batch_indices.append(i)
+            
+        # Build reward dictionary with all standard rewards
+        reward_dict = {
+            'answer_correctness': answer_reward_tensor,
+            'answer_sub_em': answer_sub_em_reward_tensor,
+            'f1_score': f1_score_reward_tensor,
+            'format_correctness': format_reward_tensor,
+            'retrieval_correctness': retrieval_reward_tensor,
+            'mixed_outcome_reward': mixed_outcome_reward_tensor,
+            'final_em_format': final_em_format_reward_tensor,
+            'avg_step_retrieval_format': avg_step_retrieval_format_reward_tensor,
+            'turn_level_reward': turn_level_reward_tensor,
+        }
+        
+        # Process judge rewards using async batch processing if needed
+        if is_judge:
+            print("[INFO] Processing judge rewards using async batch processing...")
+
+            judge_outcome_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+            judge_turn_reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+
+            # Get the first data source (assuming all items have the same data source for batch processing)
+            first_data_source = data[0].non_tensor_batch['data_source']
+            
+            compute_judge_outcome_score = _select_rm_score_fn(first_data_source, reward_type='judge_outcome_reward')
+            
+            # Use async batch processing
+            batch_judge_outcome_scores = compute_judge_outcome_score(
+                batch_mid_turns=batch_mid_turns,
+                batch_final_turns=batch_final_turns,
+                batch_solutions=batch_solutions,
+                batch_ground_truths=batch_ground_truths,
+                host=self.config.get('judge_host', 'slurm-h100-206-129'), 
+                port=self.config.get('judge_port', 8002),
+                judge_model_name=self.config.get('judge_model_name', 'Qwen/Qwen2.5-72B-Instruct'),
+                use_async=True
+            )
+            
+            # Assign batch results to tensors
+            for i, judge_outcome_score in zip(batch_indices, batch_judge_outcome_scores):
+                data_item = data[i]
+                valid_response_length = data_item.batch['attention_mask'][data_item.batch['prompts'].shape[-1]:].sum()    
+                judge_outcome_reward_tensor[i, valid_response_length - 1] = judge_outcome_score
+            
+            reward_dict.update({
+                'judge_outcome_reward': judge_outcome_reward_tensor,
+            })
+            
+            if reward_type == 'judge_turn_reward':
+                compute_judge_turn_level_score = _select_rm_score_fn(first_data_source, reward_type='judge_turn_reward')
+                
+                # Use async batch processing
+                batch_judge_turn_level_scores = compute_judge_turn_level_score(
+                    batch_mid_turns=batch_mid_turns,
+                    batch_final_turns=batch_final_turns,
+                    batch_solutions=batch_solutions,
+                    batch_ground_truths=batch_ground_truths,
+                    host=self.config.get('judge_host', 'slurm-h100-206-129'), 
+                    port=self.config.get('judge_port', 8002),
+                    judge_model_name=self.config.get('judge_model_name', 'Qwen/Qwen2.5-72B-Instruct'),
+                    use_async=True
+                )
+                
+                # Assign batch results to tensors
+                for i, judge_turn_level_score in zip(batch_indices, batch_judge_turn_level_scores):
+                    for j in range(data.meta_info['num_turns'][i]):
+                        judge_turn_reward_tensor[i, data.meta_info['turn_indices'][i][j][1]] = judge_turn_level_score[j]
+
+                reward_dict.update({
+                    'judge_turn_reward': judge_turn_reward_tensor,
+                })
+
+        return reward_dict
+
+import ray
+import hydra
+
+
+@hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
+def main(config):
+    if not ray.is_initialized():
+        # this is for local ray cluster
+        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+
+    ray.get(main_task.remote(config))
+
+
+@ray.remote
+def main_task(config):
+    from verl.utils.fs import copy_local_path_from_hdfs
+    from transformers import AutoTokenizer
+
+    # print initial config
+    from pprint import pprint
+    from omegaconf import OmegaConf
+    pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+    OmegaConf.resolve(config)
+
+    # env_class = ENV_CLASS_MAPPING[config.env.name]
+
+    # download the checkpoint from hdfs
+    local_path = copy_local_path_from_hdfs(config.actor_rollout_ref.model.path)
+
+    # instantiate tokenizer
+    from verl.utils import hf_tokenizer
+    tokenizer = hf_tokenizer(local_path)
+
+    # define worker classes
+    if config.actor_rollout_ref.actor.strategy == 'fsdp':
+        assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
+        from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+        from verl.single_controller.ray import RayWorkerGroup
+        ray_worker_group_cls = RayWorkerGroup
+
+    elif config.actor_rollout_ref.actor.strategy == 'megatron':
+        assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
+        from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
+        from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+        ray_worker_group_cls = NVMegatronRayWorkerGroup
+
+    else:
+        raise NotImplementedError
+
+    from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+
+    role_worker_mapping = {
+        Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
+        Role.Critic: ray.remote(CriticWorker),
+        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
+    }
+
+    global_pool_id = 'global_pool'
+    resource_pool_spec = {
+        global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+    }
+    mapping = {
+        Role.ActorRollout: global_pool_id,
+        Role.Critic: global_pool_id,
+        Role.RefPolicy: global_pool_id,
+    }
+
+    # we should adopt a multi-source reward function here
+    # - for rule-based rm, we directly call a reward score
+    # - for model-based rm, we call a model
+    # - for code related prompt, we send to a sandbox if there are test cases
+    # - finally, we combine all the rewards together
+    # - The reward type depends on the tag of the data
+    # if config.reward_model.enable:
+    #     if config.reward_model.strategy == 'fsdp':
+    #         from verl.workers.fsdp_workers import RewardModelWorker
+    #     elif config.reward_model.strategy == 'megatron':
+    #         from verl.workers.megatron_workers import RewardModelWorker
+    #     else:
+    #         raise NotImplementedError
+    #     role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
+    #     mapping[Role.RewardModel] = global_pool_id
+
+    if config.reward_model.enable:
+        from istar.rm_fsdp_workers import ISTARRewardModelWorker
+        role_worker_mapping[Role.RewardModel] = ray.remote(ISTARRewardModelWorker)
+        mapping[Role.RewardModel] = global_pool_id
+
+    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, config=config, is_val=False)
+
+    # Note that we always use function-based RM for validation
+    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1, config=config, is_val=True)
+
+    resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    trainer = RayPPOTrainer(config=config,
+                            tokenizer=tokenizer,
+                            role_worker_mapping=role_worker_mapping,
+                            resource_pool_manager=resource_pool_manager,
+                            ray_worker_group_cls=ray_worker_group_cls,
+                            reward_fn=reward_fn,
+                            val_reward_fn=val_reward_fn,
+                            )
+    trainer.init_workers()
+    trainer.fit()
+
+
+if __name__ == '__main__':
+    main()

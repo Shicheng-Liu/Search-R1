@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""
+Async VLLM Client for Search-Enabled Reasoning
+
+An asynchronous client for batch processing with VLLM servers to perform 
+search-enabled reasoning and answer evaluation with scoring capabilities.
+"""
+
+import argparse
+import asyncio
+import logging
+import random
+from typing import List, Tuple, Optional
+
+from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm
+
+# Import shared components from vllm_client.py
+from vllm_serve.vllm_client import JudgeEvaluator, DataProcessor, DEFAULT_DATA_PATH
+
+
+# ============================================================================
+# Async VLLM Client Class
+# ============================================================================
+
+class AsyncVLLMClient:
+    def __init__(self, host="0.0.0.0", port=8002, model="openai/gpt-oss-20b"):
+        self.base_url = f"http://{host}:{port}/v1"
+        self.model = model
+        self.client = AsyncOpenAI(api_key="EMPTY", base_url=self.base_url)
+        self.log = logging.getLogger(self.__class__.__name__)
+
+    async def aclose(self):
+        # OpenAI python supports async close on the async client
+        await self.client.close()
+    
+    async def generate_text(self, prompt: str, max_tokens: int = 2048) -> Optional[str]:
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.log.error(f"Chat error: {e}")
+            return None
+
+# ============================================================================
+# Async Batch Processing Functions  
+# ============================================================================
+
+# async def run_batch(
+#     samples: List[Tuple[str, List[str], str]],
+#     client: AsyncVLLMClient,
+#     concurrency: int = 16,
+#     max_tokens: int = 2048,
+#     max_retries: int = 2,
+#     judge_mode: str = "turn",
+# ):
+#     sem = asyncio.Semaphore(concurrency)
+
+#     async def one_job(idx: int, sample):
+#         prompt, turns, ground_truth = sample
+        
+#         if judge_mode == "outcome":
+#             judge_prompt = JudgeEvaluator.create_outcome_judge_prompt(prompt, turns, ground_truth)
+#         else:  # default to "turn"
+#             judge_prompt = JudgeEvaluator.create_turn_judge_prompt(prompt, turns, ground_truth)
+#         for attempt in range(max_retries + 1):
+#             try:
+#                 async with sem:
+#                     text = await client.generate_text(judge_prompt, max_tokens=max_tokens)
+#                 return idx, text
+#             except Exception:
+#                 if attempt >= max_retries:
+#                     return idx, None
+#                 await asyncio.sleep(0.1)
+
+#     tasks = [asyncio.create_task(one_job(i, s)) for i, s in enumerate(samples)]
+    
+#     # Use tqdm to track async batch completion progress
+#     results = []
+#     for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing batch"):
+#         result = await coro
+#         results.append(result)
+    
+#     results.sort(key=lambda x: x[0])
+#     return [r[1] for r in results]
+
+async def run_batch(
+    samples: List[Tuple[str, List[str], str]],
+    client: AsyncVLLMClient,
+    concurrency: int = 16,
+    max_tokens: int = 2048,
+    max_retries: int = 2,
+    judge_mode: str = "turn",
+):
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one_job(idx: int, sample):
+        prompt, turns, ground_truth = sample
+        if judge_mode == "outcome":
+            judge_prompt = JudgeEvaluator.create_outcome_judge_prompt(prompt, turns, ground_truth)
+        else:
+            judge_prompt = JudgeEvaluator.create_turn_judge_prompt(prompt, turns, ground_truth)
+
+        for attempt in range(max_retries + 1):
+            async with sem:
+                text = await client.generate_text(judge_prompt, max_tokens=max_tokens)
+            if text is not None:
+                return idx, text
+            if attempt < max_retries:
+                await asyncio.sleep(0.1)
+        return idx, None
+
+    tasks = [asyncio.create_task(one_job(i, s)) for i, s in enumerate(samples)]
+
+    results = []
+    try:
+        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing batch"):
+            results.append(await fut)
+    finally:
+        # Cancel any leftover tasks (if we exited early due to error/cancel)
+        pending = [t for t in tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        # IMPORTANT: retrieve exceptions to avoid "Task exception was never retrieved"
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    results.sort(key=lambda x: x[0])
+    return [r[1] for r in results]
+
+
+
+# ============================================================================
+# Command Line Interface
+# ============================================================================
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Async Batch evaluation with VLLM")
+    parser.add_argument("--host", type=str, default="0.0.0.0", 
+                       help="VLLM server host")
+    parser.add_argument("--port", type=int, default=8002,
+                       help="VLLM server port") 
+    parser.add_argument("--model", type=str, default="openai/gpt-oss-20b",
+                       help="Model name")
+    parser.add_argument("--data_path", type=str, default=DEFAULT_DATA_PATH,
+                       help="Path to data file")
+    parser.add_argument("--num_samples", type=int, default=256,
+                       help="Number of samples to process")
+    parser.add_argument("--concurrency", type=int, default=64,
+                       help="Number of concurrent requests")
+    parser.add_argument("--max_tokens", type=int, default=2048,
+                       help="Maximum tokens per generation")
+    parser.add_argument("--max_retries", type=int, default=1,
+                       help="Maximum number of retries")
+    parser.add_argument("--judge-mode", type=str, default="outcome",
+                       choices=["turn", "outcome"],
+                       help="Judge evaluation mode: turn (evaluate each turn), outcome (evaluate final result)")
+    return parser.parse_args()
+
+
+async def amain(args):
+    """Main async function to run batch evaluation."""
+    logging.basicConfig(level=logging.INFO)
+    
+    # Load sample data
+    samples = DataProcessor.get_sample_data(json_file=args.data_path, num_samples=args.num_samples)
+    print(f"Loaded {len(samples)} samples from {args.data_path}")
+    
+    # Create client
+    client = AsyncVLLMClient(host=args.host, port=args.port, model=args.model)
+    print(f"Initialized client for {args.host}:{args.port} with model {args.model}")
+
+    try:
+        # Run batch processing
+        judge_texts = await run_batch(
+            samples,
+            client=client,
+            concurrency=args.concurrency,
+            max_tokens=args.max_tokens,
+            max_retries=args.max_retries,
+            judge_mode=args.judge_mode,
+        )
+        print(f"Completed batch processing: {len(judge_texts)} results")
+
+
+    # finally:
+    #     # Essential cleanup to prevent connection buildup
+    #     if hasattr(client, 'client'):
+    #         try:
+    #             await client.client.aclose()
+    #         except:
+    #             pass
+
+    finally:
+        await client.aclose()
+
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+async def run_iterations():
+    """Run multiple iterations in a single event loop."""
+    args = parse_args()
+    for iteration in range(3):
+        print(f"\n{'='*50} ITERATION {iteration + 1} {'='*50}")
+        await amain(args)
+        print(f"{'='*50} END ITERATION {iteration + 1} {'='*50}\n")
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+    asyncio.run(amain(args))
+
+
+if __name__ == "__main__":
+    asyncio.run(run_iterations())
