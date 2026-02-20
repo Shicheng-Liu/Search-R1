@@ -52,6 +52,61 @@ def compute_bt_loss_rm(
 
     return total_loss / total_pairs, total_pairs
 
+def compute_irl_loss_rm(
+    token_level_scores: torch.Tensor,   # (N, T)
+    acc: torch.Tensor,                  # (N,) in {0,1}
+    uid: torch.Tensor,                  # (N,) prompt id (int)
+    response_mask: torch.Tensor,        # (N, T) 0/1
+    beta: float = 0.05,               # optional multiplier
+):
+    """
+    Maximum-likelihood IRL-style surrogate:
+      maximize  E[q | correct] - E[q | all]
+    so the loss is:
+      loss = E[q | all] - E[q | correct]
+
+    Ignores prompts where all correct or all incorrect.
+    Returns: (scalar_loss, num_prompts_used)
+    """
+    device = token_level_scores.device
+    response_mask = response_mask.float().to(device)
+    acc = acc.to(device).float()
+    uid = uid.to(device)
+
+    # cumulative reward per sample (rollout)
+    q_seq = (token_level_scores * response_mask).sum(dim=-1)  # (N,)
+
+    total_loss = torch.zeros((), device=device)
+    num_used = 0
+
+    for u in torch.unique(uid):
+        idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)  # (K,)
+        q_g = q_seq[idxs]          # (K,)
+        acc_g = acc[idxs]          # (K,)
+
+        pos_mask = acc_g > 0.5
+        neg_mask = ~pos_mask
+
+        n = pos_mask.sum().item()
+        m = neg_mask.sum().item()
+        if n == 0 or m == 0:
+            continue  # ignore: all correct or all incorrect
+
+        mean_pos = q_g[pos_mask].mean()
+        mean_all = q_g.mean()
+
+        # minimize (mean_all - mean_pos) == maximize (mean_pos - mean_all)
+        surrogate_loss_g = mean_all - mean_pos
+
+        total_loss = total_loss + surrogate_loss_g
+        num_used += 1
+
+    if num_used == 0:
+        # on-graph zero (keeps dtype/device/graph happy)
+        return (q_seq.sum() * 0.0), 0
+
+    return total_loss / num_used, num_used
+
 def compute_detach_dpo_loss_rm(token_level_scores, acc, Q_bc, acc_bc, response_mask, beta, bon_mode="none"):
     # we always assume that the BoN size equals n_samples
     # mode1: use acc as rm

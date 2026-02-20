@@ -252,19 +252,19 @@ class ISTARRewardModelWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.reward_optimizer)
 
-        # self.rm = DataParallelISTARRewardModel(
-        #     config=self.config,
-        #     reward_module=self.reward_module,
-        #     ref_module=self.ref_module,
-        #     reward_optimizer=self.reward_optimizer,
-        # )
-
-        self.rm = DataParallelLMHeadISTARRewardModel(
+        self.rm = DataParallelISTARRewardModel(
             config=self.config,
             reward_module=self.reward_module,
             ref_module=self.ref_module,
             reward_optimizer=self.reward_optimizer,
         )
+
+        # self.rm = DataParallelLMHeadISTARRewardModel(
+        #     config=self.config,
+        #     reward_module=self.reward_module,
+        #     ref_module=self.ref_module,
+        #     reward_optimizer=self.reward_optimizer,
+        # )
 
         self.flops_counter = FlopsCounter(self.reward_model_config)
         self.checkpoint_manager = FSDPCheckpointManager(

@@ -25,7 +25,7 @@ from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
-from istar.rm_utils import (compute_ce_dpo_loss_rm, compute_bt_loss_rm,
+from istar.rm_utils import (compute_ce_dpo_loss_rm, compute_bt_loss_rm, compute_irl_loss_rm,
                           compute_detach_dpo_loss_rm, compute_eto_loss_rm)
 from verl import DataProto
 from verl.utils.py_functional import append_to_dict
@@ -443,6 +443,15 @@ class DataParallelISTARRewardModel:
                         beta=beta,
                     )
 
+                elif self.config.model.loss_type == "irl":
+                    dpo_loss, num_pairs = compute_irl_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],                  # <-- now tensor uid exists
+                        response_mask=response_mask,
+                        beta=beta,
+                    )    
+                
                 elif self.config.model.loss_type == "bon_acc":
                     dpo_loss = compute_detach_dpo_loss_rm(
                         q, acc, Q_bc=mb["Q_bc"], acc_bc=mb["acc_bc"],
@@ -940,6 +949,15 @@ class DataParallelLMHeadISTARRewardModel:
 
                 elif self.config.model.loss_type == "dpo":
                     loss_val, _num_pairs = compute_bt_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                    )
+
+                elif self.config.model.loss_type == "irl":
+                    loss_val, _num_pairs = compute_irl_loss_rm(
                         token_level_scores=q,
                         acc=acc,
                         uid=mb["uid"],
