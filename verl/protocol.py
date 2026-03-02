@@ -510,6 +510,62 @@ class DataProto:
                 DataProto(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info))
 
         return output
+    
+    def chunk_by_uid_blocks(self, chunks: int, uid_key: str = "uid", block_size: int = 8) -> List["DataProto"]:
+        """
+        Split the batch into `chunks` parts, but only at boundaries of uid-blocks.
+        Assumes each uid appears exactly `block_size` times globally (or at least counts are multiples of block_size)
+        and that we want to keep all candidates for a uid on the same chunk.
+
+        Requires: len(self) % (chunks * block_size) == 0  (equal-size chunks in units of uid-blocks)
+        """
+        import numpy as np
+        import torch
+
+        assert uid_key in self.non_tensor_batch, f"missing non_tensor_batch['{uid_key}']"
+        uid = np.asarray(self.non_tensor_batch[uid_key]).astype(np.int64)
+
+        N = len(self)
+        assert N % chunks == 0, f"only support equal chunk. Got N={N}, chunks={chunks}"
+        assert N % block_size == 0, f"N={N} must be divisible by block_size={block_size}"
+
+        # Stable sort by uid so that each uid group becomes contiguous
+        perm = np.argsort(uid, kind="stable")
+        # Make a re-ordered copy (avoid in-place mutation of caller)
+        dp = DataProto(
+            batch=self.batch[torch.from_numpy(perm).to(self.batch.device)] if self.batch is not None else None,
+            non_tensor_batch={k: v[perm] for k, v in self.non_tensor_batch.items()},
+            meta_info=self.meta_info,
+        )
+
+        uid_sorted = np.asarray(dp.non_tensor_batch[uid_key]).astype(np.int64)
+
+        # Verify that uid blocks are multiples of block_size (ideally exactly block_size)
+        _, cnts = np.unique(uid_sorted, return_counts=True)
+        assert np.all(cnts % block_size == 0), (
+            f"Some uid counts not multiple of {block_size}: min={cnts.min()} max={cnts.max()}"
+        )
+
+        num_blocks = N // block_size
+        assert num_blocks % chunks == 0, (
+            f"Need equal chunking in uid-block units: num_blocks={num_blocks}, chunks={chunks}"
+        )
+        blocks_per_chunk = num_blocks // chunks
+
+        out = []
+        for i in range(chunks):
+            i0 = i * blocks_per_chunk * block_size
+            i1 = (i + 1) * blocks_per_chunk * block_size
+
+            if dp.batch is not None:
+                b_i = dp.batch[i0:i1]
+            else:
+                b_i = None
+
+            nt_i = {k: v[i0:i1] for k, v in dp.non_tensor_batch.items()}
+            out.append(DataProto(batch=b_i, non_tensor_batch=nt_i, meta_info=self.meta_info))
+
+        return out
 
     @staticmethod
     def concat(data: List['DataProto']) -> 'DataProto':

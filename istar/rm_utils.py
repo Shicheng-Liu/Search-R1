@@ -12,100 +12,315 @@ def compute_ce_dpo_loss_rm(token_level_scores, acc, response_mask, beta):
     cur_dpo_loss = torch.nn.functional.binary_cross_entropy(cur_scores, acc) # weakness: recognize current step as a positive sample when its trajectory is successful
     return cur_dpo_loss
 
-def compute_bt_loss_rm(
-    token_level_scores: torch.Tensor,   # (N, T)
-    acc: torch.Tensor,                  # (N,) in {0,1}
-    uid: torch.Tensor,                  # (N,) int64 tensor
-    response_mask: torch.Tensor,        # (N, T)
-    beta: float = 0.05,
-):
+# def compute_bt_loss_rm(
+#     token_level_scores: torch.Tensor,   # (N, T)
+#     acc: torch.Tensor,                  # (N,) in {0,1}
+#     uid: torch.Tensor,                  # (N,) int64 tensor
+#     response_mask: torch.Tensor,        # (N, T)
+#     beta: float = 0.05,
+# ):
+#     device = token_level_scores.device
+#     response_mask = response_mask.float()
+
+#     q_seq = (token_level_scores * response_mask).sum(dim=-1)  # (N,)
+#     uid = uid.to(device)
+
+#     total_loss = torch.zeros((), device=device)
+#     total_pairs = 0
+
+#     for u in torch.unique(uid):
+#         idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)  # (K,)
+#         q_g = q_seq[idxs]
+#         acc_g = acc[idxs].float()
+
+#         q_pos = q_g[acc_g > 0.5]
+#         q_neg = q_g[acc_g <= 0.5]
+
+#         n = q_pos.numel()
+#         m = q_neg.numel()
+#         if n == 0 or m == 0:
+#             continue
+
+#         diff = q_pos.unsqueeze(1) - q_neg.unsqueeze(0)  # (n, m)
+#         pair_loss = F.softplus(-beta * diff)
+
+#         total_loss = total_loss + pair_loss.sum()
+#         total_pairs += n * m
+
+#     if total_pairs == 0:
+#         return (q_seq.sum() * 0.0), 0   # on-graph zero
+
+#     return total_loss / total_pairs, total_pairs
+
+def compute_bt_loss_rm(token_level_scores, acc, uid, response_mask, beta=0.05, lam=1e-3):
     device = token_level_scores.device
-    response_mask = response_mask.float()
+    response_mask = response_mask.to(device=device, dtype=token_level_scores.dtype)
+    acc = acc.to(device=device, dtype=token_level_scores.dtype)
+    uid = uid.to(device=device)
 
-    q_seq = (token_level_scores * response_mask).sum(dim=-1)  # (N,)
-    uid = uid.to(device)
+    # length-normalized sequence score
+    lens = response_mask.sum(dim=-1).clamp_min(1.0)
+    q_seq = (token_level_scores * response_mask).sum(dim=-1) / lens
 
-    total_loss = torch.zeros((), device=device)
-    total_pairs = 0
-
+    uid_losses = []
     for u in torch.unique(uid):
-        idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)  # (K,)
+        idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)
         q_g = q_seq[idxs]
-        acc_g = acc[idxs].float()
+        a_g = acc[idxs]
 
-        q_pos = q_g[acc_g > 0.5]
-        q_neg = q_g[acc_g <= 0.5]
+        # center per-uid to remove offset freedom
+        q_g = q_g - q_g.mean()
 
-        n = q_pos.numel()
-        m = q_neg.numel()
-        if n == 0 or m == 0:
+        q_pos = q_g[a_g > 0.5]
+        q_neg = q_g[a_g <= 0.5]
+        if q_pos.numel() == 0 or q_neg.numel() == 0:
             continue
 
-        diff = q_pos.unsqueeze(1) - q_neg.unsqueeze(0)  # (n, m)
-        pair_loss = F.softplus(-beta * diff)
+        diff = q_pos[:, None] - q_neg[None, :]
+        uid_losses.append(F.softplus(-beta * diff).mean())
 
-        total_loss = total_loss + pair_loss.sum()
-        total_pairs += n * m
+    if len(uid_losses) == 0:
+        return (q_seq.sum() * 0.0), 0
 
-    if total_pairs == 0:
-        return (q_seq.sum() * 0.0), 0   # on-graph zero
+    bt_loss = torch.stack(uid_losses).mean()
 
-    return total_loss / total_pairs, total_pairs
+    # pin reward scale (optional but helpful)
+    reg = lam * (q_seq ** 2).mean()
+    return bt_loss + reg, len(uid_losses)
+
+# def compute_irl_loss_rm(
+#     token_level_scores: torch.Tensor,   # (N, T)
+#     acc: torch.Tensor,                  # (N,) in {0,1}
+#     uid: torch.Tensor,                  # (N,) prompt id (int)
+#     response_mask: torch.Tensor,        # (N, T) 0/1
+#     beta: float = 0.05,               # optional multiplier
+# ):
+#     """
+#     Maximum-likelihood IRL-style surrogate:
+#       maximize  E[q | correct] - E[q | all]
+#     so the loss is:
+#       loss = E[q | all] - E[q | correct]
+
+#     Ignores prompts where all correct or all incorrect.
+#     Returns: (scalar_loss, num_prompts_used)
+#     """
+#     device = token_level_scores.device
+#     response_mask = response_mask.float().to(device)
+#     acc = acc.to(device).float()
+#     uid = uid.to(device)
+
+#     # cumulative reward per sample (rollout)
+#     q_seq = (token_level_scores * response_mask).sum(dim=-1)  # (N,)
+
+#     total_loss = torch.zeros((), device=device)
+#     num_used = 0
+
+#     for u in torch.unique(uid):
+#         idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)  # (K,)
+#         q_g = q_seq[idxs]          # (K,)
+#         acc_g = acc[idxs]          # (K,)
+
+#         pos_mask = acc_g > 0.5
+#         neg_mask = ~pos_mask
+
+#         n = pos_mask.sum().item()
+#         m = neg_mask.sum().item()
+#         if n == 0 or m == 0:
+#             continue  # ignore: all correct or all incorrect
+
+#         mean_pos = q_g[pos_mask].mean()
+#         mean_all = q_g.mean()
+
+#         # minimize (mean_all - mean_pos) == maximize (mean_pos - mean_all)
+#         surrogate_loss_g = mean_all - mean_pos
+
+#         total_loss = total_loss + surrogate_loss_g
+#         num_used += 1
+
+#     if num_used == 0:
+#         # on-graph zero (keeps dtype/device/graph happy)
+#         return (q_seq.sum() * 0.0), 0
+
+#     return total_loss / num_used, num_used
 
 def compute_irl_loss_rm(
     token_level_scores: torch.Tensor,   # (N, T)
-    acc: torch.Tensor,                  # (N,) in {0,1}
-    uid: torch.Tensor,                  # (N,) prompt id (int)
+    acc: torch.Tensor,                  # (N,) in {0,1} (or float in [0,1])
+    uid: torch.Tensor,                  # (N,) prompt id (int64)
     response_mask: torch.Tensor,        # (N, T) 0/1
-    beta: float = 0.05,               # optional multiplier
+    beta: float = 1.0,                  # optional scale on q_seq (keeps same logic)
+    length_norm: str = "mean",          # {"sum","mean"}: keep same logic on q_seq, just normalize
+    group_weight: str = "uniform",      # {"uniform","by_group_size","by_pairs"}
+    q_clip: float = 10.0,               # clip q_seq to prevent blow-up (None disables)
+    l2_reg: float = 1e-4,               # L2 on token scores to control scale (0 disables)
 ):
     """
-    Maximum-likelihood IRL-style surrogate:
-      maximize  E[q | correct] - E[q | all]
-    so the loss is:
-      loss = E[q | all] - E[q | correct]
+    Keeps your original high-level logic per uid:
+        loss_g = mean_all(q_g) - mean_pos(q_g)
 
-    Ignores prompts where all correct or all incorrect.
-    Returns: (scalar_loss, num_prompts_used)
+    Allowed stabilizers:
+      - length normalization (sum vs mean over response tokens)
+      - optional per-seq clipping (q_clip)
+      - optional L2 regularization on token scores (l2_reg)
+      - optional group weighting when averaging across uids (group_weight)
+      - optional scaling of q_seq via beta (does NOT change the loss form)
+
+    Returns: (scalar_loss, num_used)
     """
     device = token_level_scores.device
-    response_mask = response_mask.float().to(device)
-    acc = acc.to(device).float()
-    uid = uid.to(device)
+    dtype = token_level_scores.dtype
 
-    # cumulative reward per sample (rollout)
-    q_seq = (token_level_scores * response_mask).sum(dim=-1)  # (N,)
+    response_mask = response_mask.to(device=device, dtype=dtype)
+    acc = acc.to(device=device, dtype=dtype)
+    uid = uid.to(device=device)
 
-    total_loss = torch.zeros((), device=device)
+    # --------- sequence score (same idea, but optionally length-normalized) ----------
+    # q_seq = sum_t score_t over response tokens  (or mean_t if length_norm="mean")
+    token_scores_masked = token_level_scores * response_mask
+    q_sum = token_scores_masked.sum(dim=-1)  # (N,)
+    if length_norm == "sum":
+        q_seq = q_sum
+    elif length_norm == "mean":
+        resp_len = response_mask.sum(dim=-1).clamp_min(1.0)
+        q_seq = q_sum / resp_len
+    else:
+        raise ValueError(f"length_norm must be 'sum' or 'mean', got {length_norm}")
+
+    # optional scale (keeps same loss form)
+    if beta is not None and beta != 1.0:
+        q_seq = q_seq / max(float(beta), 1e-8)
+
+    # optional clipping to prevent runaway magnitudes
+    if q_clip is not None:
+        q_seq = q_seq.clamp(min=-float(q_clip), max=float(q_clip))
+
+    # --------- optional scale control on token-level scores ----------
+    # (does not change your mean_all - mean_pos logic; just prevents exploding scores)
+    if l2_reg and l2_reg > 0:
+        denom = response_mask.sum().clamp_min(1.0)
+        reg = float(l2_reg) * (token_scores_masked.pow(2).sum() / denom)
+    else:
+        reg = torch.zeros((), device=device, dtype=dtype)
+
+    # --------- per-uid loss: mean_all - mean_pos ----------
+    total_loss = torch.zeros((), device=device, dtype=dtype)
+    total_weight = torch.zeros((), device=device, dtype=dtype)
     num_used = 0
 
     for u in torch.unique(uid):
         idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)  # (K,)
-        q_g = q_seq[idxs]          # (K,)
-        acc_g = acc[idxs]          # (K,)
+        q_g = q_seq[idxs]   # (K,)
+        acc_g = acc[idxs]   # (K,)
 
         pos_mask = acc_g > 0.5
         neg_mask = ~pos_mask
 
-        n = pos_mask.sum().item()
-        m = neg_mask.sum().item()
+        n = int(pos_mask.sum().item())
+        m = int(neg_mask.sum().item())
         if n == 0 or m == 0:
-            continue  # ignore: all correct or all incorrect
+            continue
 
         mean_pos = q_g[pos_mask].mean()
         mean_all = q_g.mean()
 
-        # minimize (mean_all - mean_pos) == maximize (mean_pos - mean_all)
-        surrogate_loss_g = mean_all - mean_pos
+        # YOUR ORIGINAL LOGIC
+        loss_g = mean_all - mean_pos
 
-        total_loss = total_loss + surrogate_loss_g
+        # weighting across groups (still the same per-group loss)
+        if group_weight == "uniform":
+            w = 1.0
+        elif group_weight == "by_group_size":
+            w = float(q_g.numel())         # K
+        elif group_weight == "by_pairs":
+            w = float(n * m)               # number of pos-neg pairs in the group
+        else:
+            raise ValueError(
+                f"group_weight must be 'uniform', 'by_group_size', or 'by_pairs', got {group_weight}"
+            )
+
+        total_loss = total_loss + loss_g * w
+        total_weight = total_weight + w
         num_used += 1
 
     if num_used == 0:
-        # on-graph zero (keeps dtype/device/graph happy)
-        return (q_seq.sum() * 0.0), 0
+        # on-graph zero, but keep reg so RM doesn't drift
+        return (q_seq.sum() * 0.0 + reg), 0
 
-    return total_loss / num_used, num_used
+    return (total_loss / total_weight) + reg, num_used
+
+def composite_rm_loss(
+    token_level_scores: torch.Tensor,   # (N,T)
+    acc: torch.Tensor,                  # (N,) {0,1}
+    uid: torch.Tensor,                  # (N,)
+    response_mask: torch.Tensor,        # (N,T) {0,1}
+    beta: float = 0.05,
+    lambda_ce: float = 1.0,
+    lambda_bt: float = 0.2,
+    lambda_irl: float = 0.2,
+):
+    device = token_level_scores.device
+    response_mask = response_mask.to(device=device, dtype=token_level_scores.dtype)
+    acc = acc.to(device=device).float()
+    uid = uid.to(device=device)
+
+    # unified, length-normalized q_seq
+    len_resp = response_mask.sum(dim=-1).clamp_min(1.0)
+    q_seq = (token_level_scores * response_mask).sum(dim=-1) / len_resp  # (N,)
+
+    # (A) CE/DPO-style: BCE on logits (stable)
+    loss_ce = F.binary_cross_entropy_with_logits(beta * q_seq, acc)
+
+    # (B) BT pairwise per-uid (balanced)
+    per_uid_bt = []
+    bt_pairs = 0
+    for u in torch.unique(uid):
+        idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)
+        q_g = q_seq[idxs]
+        a_g = acc[idxs]
+        q_pos = q_g[a_g > 0.5]
+        q_neg = q_g[a_g <= 0.5]
+        if q_pos.numel() == 0 or q_neg.numel() == 0:
+            continue
+        diff = q_pos[:, None] - q_neg[None, :]
+        per_uid_bt.append(F.softplus(-beta * diff).mean())
+        bt_pairs += q_pos.numel() * q_neg.numel()
+
+    loss_bt = (torch.stack(per_uid_bt).mean() if len(per_uid_bt) else (q_seq.sum() * 0.0))
+
+    # (C) IRL surrogate per-uid (balanced)
+    per_uid_irl = []
+    irl_used = 0
+    for u in torch.unique(uid):
+        idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)
+        q_g = q_seq[idxs]
+        a_g = acc[idxs]
+        pos = a_g > 0.5
+        neg = ~pos
+        if pos.sum() == 0 or neg.sum() == 0:
+            continue
+        mean_pos = q_g[pos].mean()
+        mean_all = q_g.mean()
+        per_uid_irl.append(mean_all - mean_pos)
+        irl_used += 1
+
+    loss_irl = (torch.stack(per_uid_irl).mean() if len(per_uid_irl) else (q_seq.sum() * 0.0))
+
+    loss = lambda_ce * loss_ce + lambda_bt * loss_bt + lambda_irl * loss_irl
+
+    metrics = {
+        "loss_total": loss.detach(),
+        "loss_ce": loss_ce.detach(),
+        "loss_bt": loss_bt.detach(),
+        "loss_irl": loss_irl.detach(),
+        "bt_pairs": torch.tensor(bt_pairs, device=device),
+        "irl_used": torch.tensor(irl_used, device=device),
+        "q_seq_mean": q_seq.detach().mean(),
+        "q_seq_std": q_seq.detach().std(unbiased=False),
+        "len_mean": len_resp.detach().mean(),
+        "len_max": len_resp.detach().max(),
+    }
+    return loss, metrics
+
 
 def compute_detach_dpo_loss_rm(token_level_scores, acc, Q_bc, acc_bc, response_mask, beta, bon_mode="none"):
     # we always assume that the BoN size equals n_samples

@@ -22,7 +22,7 @@ WAND_PROJECT='Search-R1-mixed-data'
 REWARD_TYPE='outcome_reward'
 
 export BASE_MODEL='Qwen/Qwen2.5-3B'
-EXPERIMENT_NAME=nq-qwen2.5-3b-grpo-reward-shaping-irl-${REWARD_TYPE//_/-}-2turn
+EXPERIMENT_NAME=nq-qwen2.5-3b-grpo-reward-shaping-stable-irl-${REWARD_TYPE//_/-}-2turn
 export EXPERIMENT_NAME=qw-$EXPERIMENT_NAME-$(date +%Y%m%d-%H%M%S)
 
 # set -x
@@ -86,7 +86,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     reward_model.use_dynamic_bsz=False \
     reward_model.forward_max_token_len_per_gpu=4096 \
     reward_model.step_granularity=token \
-    reward_model.istar_norm=batch_norm \
+    reward_model.istar_norm=traj_norm \
     +reward_model.update_online=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
     algorithm.no_think_rl=False \

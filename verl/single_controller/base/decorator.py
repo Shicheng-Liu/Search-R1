@@ -56,6 +56,30 @@ def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
 
     return splitted_args, splitted_kwargs
 
+# def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
+#     from verl.protocol import DataProto, DataProtoFuture
+#     splitted_args = []
+#     for arg in args:
+#         assert isinstance(arg, (DataProto, DataProtoFuture))
+#         if isinstance(arg, DataProto) and "uid" in arg.non_tensor_batch:
+#             splitted_args.append(arg.chunk_by_uid_blocks(chunks=chunks, uid_key="uid", block_size=8))
+#         else:
+#             splitted_args.append(arg.chunk(chunks=chunks))
+
+#     splitted_kwargs = {}
+#     for key, val in kwargs.items():
+#         assert isinstance(val, (DataProto, DataProtoFuture))
+#         if isinstance(val, DataProto) and "uid" in val.non_tensor_batch:
+#             splitted_kwargs[key] = val.chunk_by_uid_blocks(
+#                 chunks=chunks,
+#                 uid_key="uid",
+#                 block_size=8,   # = n_agent * n_roll
+#             )
+#         else:
+#             splitted_kwargs[key] = val.chunk(chunks=chunks)
+
+#     return splitted_args, splitted_kwargs
+
 
 def dispatch_one_to_all(worker_group, *args, **kwargs):
     args = tuple([arg] * worker_group.world_size for arg in args)

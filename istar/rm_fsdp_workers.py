@@ -241,7 +241,7 @@ class ISTARRewardModelWorker(Worker):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
-        from istar.dp_rm import DataParallelISTARRewardModel, DataParallelLMHeadISTARRewardModel
+        from istar.dp_rm import DataParallelISTARRewardModel, DataParallelPotentialRewardModel, DataParallelLMHeadISTARRewardModel
 
         self.reward_module, self.ref_module, self.reward_optimizer, self.reward_lr_scheduler = self._build_reward_ref_model_optimizer(config=self.config)
 
@@ -258,6 +258,13 @@ class ISTARRewardModelWorker(Worker):
             ref_module=self.ref_module,
             reward_optimizer=self.reward_optimizer,
         )
+
+        # self.rm = DataParallelPotentialRewardModel(
+        #     config=self.config,
+        #     reward_module=self.reward_module,
+        #     ref_module=self.ref_module,
+        #     reward_optimizer=self.reward_optimizer,
+        # )
 
         # self.rm = DataParallelLMHeadISTARRewardModel(
         #     config=self.config,
@@ -315,6 +322,7 @@ class ISTARRewardModelWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_rm(self, data: DataProto):
+
         data = data.to("cuda")
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.reward_module)

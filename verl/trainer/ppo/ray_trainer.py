@@ -38,7 +38,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance, karmarkar_karp
 
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
@@ -140,6 +140,7 @@ def pad_dataproto_to_match(outputs, pad_token_id: int):
     return outputs
 
 
+
 def build_qbc_accbc(batch, num_rollout: int):
     """
     Aligns with the first-set behavior:
@@ -225,6 +226,115 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     return data, metrics
 
+
+def _debug_bt_uid_acc(batch, *, n_agent=None, n_roll=None, tag="pre_update_rm"):
+    import numpy as np
+    import torch
+
+    print("\n" + "=" * 90)
+    print(f"[BT-DEBUG] {tag}")
+    print("-" * 90)
+
+    # ---------- 0) Basic presence ----------
+    assert "acc" in batch.batch, "[BT-DEBUG] missing batch.batch['acc']"
+    assert "uid" in batch.non_tensor_batch, "[BT-DEBUG] missing batch.non_tensor_batch['uid']"
+
+    acc_t = batch.batch["acc"].detach()
+    if acc_t.is_cuda:
+        acc_t_cpu = acc_t.float().cpu()
+    else:
+        acc_t_cpu = acc_t.float()
+
+    uid_nt = np.asarray(batch.non_tensor_batch["uid"])
+    try:
+        uid_nt_i64 = uid_nt.astype(np.int64)
+    except Exception as e:
+        print("[BT-DEBUG] uid non_tensor cannot cast to int64:", type(uid_nt), uid_nt.dtype, "err:", repr(e))
+        uid_nt_i64 = None
+
+    # ---------- 1) Global uid stats (invariant A) ----------
+    if uid_nt_i64 is not None:
+        vals, cnts = np.unique(uid_nt_i64, return_counts=True)
+        print(f"[BT-DEBUG] N={len(uid_nt_i64)} unique_uids={len(vals)} uid_count(min/mean/max)={cnts.min()}/{cnts.mean():.2f}/{cnts.max()}")
+        if n_agent is not None and n_roll is not None:
+            cands_per_prompt = int(n_agent) * int(n_roll)
+            bad = int(np.sum(cnts != cands_per_prompt))
+            print(f"[BT-DEBUG] expected cands_per_prompt={cands_per_prompt}  bad_uid_groups(count!=expected)={bad}")
+        else:
+            print("[BT-DEBUG] (n_agent/n_roll not provided) cannot check expected candidates per prompt.")
+
+    # ---------- 2) uid tensor alignment check (invariant B) ----------
+    if "uid" in batch.batch:
+        uid_t = batch.batch["uid"].detach()
+        uid_t_cpu = uid_t.long().cpu().numpy()
+        if uid_nt_i64 is not None:
+            print(f"[BT-DEBUG] uid tensor exists. matches non_tensor? {bool(np.array_equal(uid_t_cpu, uid_nt_i64))}")
+        else:
+            print("[BT-DEBUG] uid tensor exists, but non_tensor uid not int64-castable; skipping match check.")
+    else:
+        print("[BT-DEBUG] uid tensor NOT in batch.batch (it will be created inside update_rm in your code).")
+
+    # ---------- 3) traj_uid uniqueness + pattern sanity (invariant C) ----------
+    if "traj_uid" in batch.non_tensor_batch:
+        traj = np.asarray(batch.non_tensor_batch["traj_uid"], dtype=object)
+        uniq_traj = len(set(traj.tolist())) == len(traj)
+        print(f"[BT-DEBUG] traj_uid present. unique? {uniq_traj}")
+        if uid_nt_i64 is not None and len(traj) > 0:
+            # optional pattern spot-check: "<uid>_c<k>"
+            s = str(traj[0])
+            ok_pat = ("_c" in s)
+            print(f"[BT-DEBUG] traj_uid pattern spot-check (first='{s[:50]}...'): has '_c'? {ok_pat}")
+    else:
+        print("[BT-DEBUG] traj_uid not present (ok).")
+
+    # ---------- 4) acc stats + per-uid label mixture (core, not using pair count) ----------
+    acc_np = acc_t_cpu.numpy()
+    print(f"[BT-DEBUG] acc stats: mean={float(acc_np.mean()):.4f} min={float(acc_np.min()):.4f} max={float(acc_np.max()):.4f} unique~={np.unique(acc_np)[:10].tolist()}{'...' if np.unique(acc_np).size>10 else ''}")
+
+    # Compute per-uid mixture: both / only_pos / only_neg
+    if uid_nt_i64 is not None:
+        uid_t_for_group = torch.from_numpy(uid_nt_i64)
+    else:
+        # fallback: if no int64 uid, try to use uid tensor if present
+        if "uid" in batch.batch:
+            uid_t_for_group = batch.batch["uid"].detach().cpu().long()
+        else:
+            uid_t_for_group = None
+
+    if uid_t_for_group is not None:
+        uid_u = torch.unique(uid_t_for_group)
+        both = only_pos = only_neg = 0
+        for u in uid_u:
+            idx = (uid_t_for_group == u).nonzero(as_tuple=False).squeeze(-1)
+            a = acc_t_cpu[idx]
+            has_pos = bool((a > 0.5).any().item())
+            has_neg = bool((a <= 0.5).any().item())
+            if has_pos and has_neg:
+                both += 1
+            elif has_pos:
+                only_pos += 1
+            else:
+                only_neg += 1
+        print(f"[BT-DEBUG] per-uid acc mixture: both={both} only_pos={only_pos} only_neg={only_neg} (total_uids={int(uid_u.numel())})")
+    else:
+        print("[BT-DEBUG] cannot compute per-uid mixture (no usable uid).")
+
+    # ---------- 5) Microbatch-level “group split” check (what BT actually sees inside update_rm) ----------
+    # We emulate your update_rm split behavior on CPU (no forward, just uid multiplicity per chunk).
+    # IMPORTANT: this tests whether .split() will slice uid-groups apart.
+    try:
+        td = batch.select(batch_keys=["uid", "acc"]).batch if hasattr(batch, "select") else None
+    except Exception:
+        td = None
+
+    if td is not None and "uid" in td:
+        # mimic: dataloader = batch.split(mini_batch_size) then mini.split(micro_batch_size)
+        mini_bsz = getattr(getattr(batch, "meta_info", {}), "get", lambda k, d=None: d)("mini_batch_size", None)
+        print("[BT-DEBUG] Note: cannot read mini_batch_size from batch.meta_info; microbatch split test will use your config values if you pass them manually.")
+    else:
+        print("[BT-DEBUG] skip microbatch split test (cannot access tensordict 'uid'/'acc' here).")
+
+    print("=" * 90)
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
     # prepare response group
@@ -871,6 +981,87 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+
+    def _balance_batch_group_aware(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
+        """
+        Reorder data on the controller such that each DP rank gets similar total tokens,
+        BUT keep samples with the same uid together (e.g., 8-per-uid group stays intact).
+
+        This guarantees that later sequential chunking (DataProto.chunk(world_size)) will
+        not split a uid-group across ranks.
+        """
+        import torch
+        from collections import OrderedDict
+        import numpy as np
+
+        attention_mask = batch.batch['attention_mask']
+        B = attention_mask.shape[0]
+        seqlen = attention_mask.view(B, -1).sum(-1).tolist()
+
+        world_size = self.actor_rollout_wg.world_size
+
+        uid = batch.non_tensor_batch.get("uid", None)
+        if uid is None:
+            # fall back to your old behavior if no uid
+            return self._balance_batch(batch, metrics, logging_prefix)
+
+        uid_list = uid.tolist() if hasattr(uid, "tolist") else list(uid)
+
+        # ---- build uid -> list of sample indices (preserve current within-uid order) ----
+        groups = OrderedDict()
+        for i, u in enumerate(uid_list):
+            groups.setdefault(u, []).append(i)
+
+        group_keys = list(groups.keys())
+        group_indices = [groups[u] for u in group_keys]
+        num_groups = len(group_indices)
+
+        # ---- sanity: ensure group size is uniform (your requirement: 8) ----
+        sizes = [len(idxs) for idxs in group_indices]
+        if min(sizes) != max(sizes):
+            # can't safely keep groups intact if inconsistent; fall back
+            return self._balance_batch(batch, metrics, logging_prefix)
+
+        group_size = sizes[0]
+        # If you *require* exactly 8:
+        if group_size != self.config.actor_rollout_ref.rollout.n_agent:
+            return self._balance_batch(batch, metrics, logging_prefix)
+
+        if num_groups < world_size:
+            # not enough groups to distribute
+            return self._balance_batch(batch, metrics, logging_prefix)
+
+        # ---- compute group weights (sum of token lengths in the group) ----
+        group_weights = [sum(seqlen[i] for i in idxs) for idxs in group_indices]
+
+        # ---- partition groups across ranks ----
+        # equal_size=True only if groups divide evenly across ranks
+        equal_groups = (num_groups % world_size == 0)
+        group_partitions = karmarkar_karp(
+            seqlen_list=group_weights,
+            k_partitions=world_size,
+            equal_size=equal_groups,
+        )
+        # group_partitions: List[List[group_id]]
+
+        # ---- build reordered sample index list: rank0 groups then rank1 ... ----
+        new_order = []
+        for part in group_partitions:
+            for gid in sorted(part):   # optional: stable within-part
+                new_order.extend(group_indices[gid])
+
+        global_idx = torch.tensor(new_order, device=attention_mask.device, dtype=torch.long)
+        batch.reorder(global_idx)
+
+        # ---- metrics: how balanced are sums after group-aware partition ----
+        balanced_group_sums = [sum(group_weights[gid] for gid in part) for part in group_partitions]
+        metrics.update({
+            f'{logging_prefix}/group_balanced_min': float(min(balanced_group_sums)),
+            f'{logging_prefix}/group_balanced_max': float(max(balanced_group_sums)),
+            f'{logging_prefix}/group_balanced_minmax_diff': float(max(balanced_group_sums) - min(balanced_group_sums)),
+            f'{logging_prefix}/group_size': float(group_size),
+        })
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1007,7 +1198,7 @@ class RayPPOTrainer(object):
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
+                    self._balance_batch_group_aware(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
@@ -1053,14 +1244,21 @@ class RayPPOTrainer(object):
                             # If answer_correctness is already 0/1 at final token, sum is 0/1; keep as is.
                             batch.batch["acc"] = (acc_scalar > 0).float()
 
-                        
+                        ##############################debug_start######################################
+
+                        # n_agent = int(self.config.actor_rollout_ref.rollout.n_agent)
+                        # n_roll  = int(self.config.actor_rollout_ref.rollout.n)
+                        # _debug_bt_uid_acc(batch, n_agent=n_agent, n_roll=n_roll, tag=f"iter={self.global_steps} pre_update_rm")
+                        # input()
+
+                        ##############################debug_end######################################
 
                         # RM update (NEW)
                         if self.use_rm:
                             rm_out = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(rm_out)
                             update_freq = self.config.reward_model.get("update_freq", 1)
-                            if self.config.reward_model.model.loss_type in ["dpo", "bon_acc", "bon_rm", "eto"]:
+                            if self.config.reward_model.model.loss_type != "ce":
                                 batch = build_qbc_accbc(batch, num_rollout=self.config.reward_model.num_rollout)
                             if self.global_steps % update_freq == 0:
                                 if self.config.reward_model.model.loss_type == "eto":
@@ -1137,6 +1335,9 @@ class RayPPOTrainer(object):
                         train_metric_dict.update(self._track_reward_metrics(avg_step_retrieval_format_reward_tensor, train_data_sources, prefix="train/avg_step_retrieval_format_reward"))
                         if 'judge' in reward_type:
                             train_metric_dict.update(self._track_reward_metrics(judge_outcome_reward_tensor, train_data_sources, prefix="train/judge_outcome_reward"))
+                        if self.use_rm:
+                            rm_metrics = rm_scores_upd.meta_info.get("metrics", {})
+                            train_metric_dict.update(rm_metrics)
 
                         metrics.update(train_metric_dict)
                         logger.log(data=train_metric_dict, step=self.global_steps)
@@ -1149,6 +1350,17 @@ class RayPPOTrainer(object):
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+
+
+                        ##############################debug_start###########################
+                        # import collections
+                        # uid = batch.non_tensor_batch["uid"]
+                        # uid_list = uid.tolist() if hasattr(uid, "tolist") else list(uid)
+                        # cnt = collections.Counter(uid_list)
+                        # bad = [(u,c) for (u,c) in cnt.items() if c != 8]   # since n_agent=8, n_roll=1
+                        # print("num_uids:", len(cnt), "bad_groups:", len(bad), "example:", bad[:10])
+                        # input()
+                        ##############################debug_end###########################
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
