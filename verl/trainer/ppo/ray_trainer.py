@@ -1229,29 +1229,13 @@ class RayPPOTrainer(object):
 
                     
                     with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
                         
-
                         # we combine with rule-based rm
                         reward_dict = self.reward_fn(batch)
                         if "acc" not in batch.batch:
-                            # reward_dict['answer_correctness'] is token-level (bs, T) in your codebase.
-                            # Convert to scalar per sample:
                             acc_scalar = reward_dict["answer_correctness"].sum(dim=-1)  # (bs,)
-                            # Binarize if needed (depends on your reward definition)
-                            # If answer_correctness is already 0/1 at final token, sum is 0/1; keep as is.
                             batch.batch["acc"] = (acc_scalar > 0).float()
 
-                        ##############################debug_start######################################
-
-                        # n_agent = int(self.config.actor_rollout_ref.rollout.n_agent)
-                        # n_roll  = int(self.config.actor_rollout_ref.rollout.n)
-                        # _debug_bt_uid_acc(batch, n_agent=n_agent, n_roll=n_roll, tag=f"iter={self.global_steps} pre_update_rm")
-                        # input()
-
-                        ##############################debug_end######################################
 
                         # RM update (NEW)
                         if self.use_rm:
