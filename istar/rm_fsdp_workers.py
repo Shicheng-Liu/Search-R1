@@ -320,9 +320,54 @@ class ISTARRewardModelWorker(Worker):
             offload_fsdp_model_to_cpu(self.ref_module)
         return output
 
+    # @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    # def update_rm(self, data: DataProto):
+
+    #     data = data.to("cuda")
+    #     if self._is_offload_param:
+    #         load_fsdp_model_to_gpu(self.reward_module)
+    #     if self._is_offload_param and self.ref_module is not None:
+    #         load_fsdp_model_to_gpu(self.ref_module)
+    #     if self._is_offload_optimizer:
+    #         load_fsdp_optimizer(optimizer=self.reward_optimizer, device_id=torch.cuda.current_device())
+
+    #     # perform forward computation
+    #     with self.ulysses_sharding_manager:
+    #         data = self.ulysses_sharding_manager.preprocess_data(data=data)
+
+    #         rm_scores, metrics = self.rm.update_rm(data=data)
+
+    #         self.reward_lr_scheduler.step()
+    #         lr = self.reward_lr_scheduler.get_last_lr()[0]
+    #         metrics["reward_model/lr"] = lr
+
+    #         prompt_length = data.batch["prompts"].shape[-1]
+    #         response_mask = data.batch["attention_mask"][:, prompt_length:]
+    #         acc = data.batch["acc"]
+
+    #         # dpo_acc_before = compute_dpo_accuracy(rm_scores, acc, response_mask=response_mask, n_samples=data.meta_info["n"])
+    #         # dpo_acc_abs = compute_dpo_abs_accuracy(rm_scores, acc, response_mask, n_samples=data.meta_info["n"])
+    #         dpo_acc_before = compute_dpo_accuracy(rm_scores, acc, response_mask=response_mask, n_samples=self.config.num_rollout)
+    #         dpo_acc_abs = compute_dpo_abs_accuracy(rm_scores, acc, response_mask, n_samples=self.config.num_rollout)
+
+    #         metrics["reward_model/dpo_acc_before"] = dpo_acc_before.detach().item()
+    #         metrics["reward_model/dpo_acc_abs_before"] = dpo_acc_abs.detach().item()
+
+    #         output = DataProto.from_dict(tensors={"rm_scores": rm_scores}, meta_info={"metrics": metrics})
+    #         output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
+    #     if self._is_offload_param:
+    #         offload_fsdp_model_to_cpu(self.reward_module)
+    #     if self._is_offload_param and self.ref_module is not None:
+    #         offload_fsdp_model_to_cpu(self.ref_module)
+    #     if self._is_offload_optimizer:
+    #         offload_fsdp_optimizer(optimizer=self.reward_optimizer)
+    #     output = output.to("cpu")
+    #     return output
+
+    ########################replay buffer revised#############################
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_rm(self, data: DataProto):
-
         data = data.to("cuda")
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.reward_module)
@@ -331,7 +376,6 @@ class ISTARRewardModelWorker(Worker):
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.reward_optimizer, device_id=torch.cuda.current_device())
 
-        # perform forward computation
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
 
@@ -341,17 +385,41 @@ class ISTARRewardModelWorker(Worker):
             lr = self.reward_lr_scheduler.get_last_lr()[0]
             metrics["reward_model/lr"] = lr
 
-            prompt_length = data.batch["prompts"].shape[-1]
-            response_mask = data.batch["attention_mask"][:, prompt_length:]
-            acc = data.batch["acc"]
+            # ---------------------------
+            # Replay-safe DPO accuracy metric
+            # ---------------------------
+            meta = getattr(data, "meta_info", {}) or {}
+            n_samples = meta.get("n_samples", None)  # e.g., 8 for group, 2 for pair
+            batch_layout = meta.get("batch_layout", None)  # "contiguous_groups" / "contiguous_pairs" / None
+            loss_type = getattr(self.config.model, "loss_type", None)
 
-            # dpo_acc_before = compute_dpo_accuracy(rm_scores, acc, response_mask=response_mask, n_samples=data.meta_info["n"])
-            # dpo_acc_abs = compute_dpo_abs_accuracy(rm_scores, acc, response_mask, n_samples=data.meta_info["n"])
-            dpo_acc_before = compute_dpo_accuracy(rm_scores, acc, response_mask=response_mask, n_samples=self.config.num_rollout)
-            dpo_acc_abs = compute_dpo_abs_accuracy(rm_scores, acc, response_mask, n_samples=self.config.num_rollout)
+            # compute only when meaningful & valid
+            if (
+                loss_type in {"dpo", "ce+dpo", "irl+dpo"} and
+                batch_layout in {"contiguous_groups", "contiguous_pairs"} and
+                isinstance(n_samples, int) and n_samples >= 2 and
+                "prompts" in data.batch and "attention_mask" in data.batch and "acc" in data.batch
+            ):
+                prompt_length = data.batch["prompts"].shape[-1]
+                response_mask = data.batch["attention_mask"][:, prompt_length:]
+                acc = data.batch["acc"]
 
-            metrics["reward_model/dpo_acc_before"] = dpo_acc_before.detach().item()
-            metrics["reward_model/dpo_acc_abs_before"] = dpo_acc_abs.detach().item()
+                try:
+                    dpo_acc_before = compute_dpo_accuracy(rm_scores, acc, response_mask=response_mask, n_samples=n_samples)
+                    dpo_acc_abs = compute_dpo_abs_accuracy(rm_scores, acc, response_mask=response_mask, n_samples=n_samples)
+                    metrics["reward_model/dpo_acc_before"] = float(dpo_acc_before.detach().item())
+                    metrics["reward_model/dpo_acc_abs_before"] = float(dpo_acc_abs.detach().item())
+                    metrics["reward_model/n_samples_metric"] = int(n_samples)
+                    metrics["reward_model/batch_layout"] = str(batch_layout)
+                except Exception as e:
+                    metrics["reward_model/dpo_acc_error"] = str(e)
+            else:
+                # keep it explicit (avoid silently wrong metric)
+                metrics["reward_model/dpo_acc_skipped"] = 1.0
+                if isinstance(n_samples, int):
+                    metrics["reward_model/n_samples_metric"] = int(n_samples)
+                if batch_layout is not None:
+                    metrics["reward_model/batch_layout"] = str(batch_layout)
 
             output = DataProto.from_dict(tensors={"rm_scores": rm_scores}, meta_info={"metrics": metrics})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
@@ -362,8 +430,8 @@ class ISTARRewardModelWorker(Worker):
             offload_fsdp_model_to_cpu(self.ref_module)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.reward_optimizer)
-        output = output.to("cpu")
-        return output
+
+        return output.to("cpu")
     
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

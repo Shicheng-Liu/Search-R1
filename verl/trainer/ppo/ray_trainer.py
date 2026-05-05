@@ -16,13 +16,13 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import os
+import os,math
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Type, Dict, List, Union, Optional
+from typing import Type, Dict, List, Union, Optional, Tuple, Any
 
 import re
 import json
@@ -42,6 +42,12 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
+
+import random
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
 
 WorkerType = Type[Worker]
 
@@ -83,6 +89,607 @@ class ResourcePoolManager:
     def get_resource_pool(self, role: Role) -> RayResourcePool:
         """Get the resource pool of the worker_cls"""
         return self.resource_pool_dict[self.mapping[role]]
+
+
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _ensure_uid_tensor(data) -> None:
+    """
+    Ensure data.batch["uid"] exists as torch.long of shape (B,).
+    Uses data.non_tensor_batch["uid"] if needed.
+    """
+    if "uid" in data.batch:
+        if data.batch["uid"].dtype != torch.long:
+            data.batch["uid"] = data.batch["uid"].long()
+        return
+
+    if not hasattr(data, "non_tensor_batch") or "uid" not in data.non_tensor_batch:
+        raise KeyError("uid not found in data.batch or data.non_tensor_batch")
+
+    uid0 = np.asarray(data.non_tensor_batch["uid"])
+    uid0 = uid0.astype(np.int64)
+    data.batch["uid"] = torch.from_numpy(uid0).long()
+
+
+def _to_cpu_detached(x: torch.Tensor, *, cast_mask_to_uint8: bool = True) -> torch.Tensor:
+    """
+    Store tensors on CPU to save GPU memory.
+    Optionally cast attention_mask to uint8 to save memory.
+    """
+    x = x.detach().to("cpu")
+    if cast_mask_to_uint8 and x.dtype == torch.long and x.dim() >= 1:
+        # only cast masks if caller uses this appropriately
+        pass
+    return x
+
+def _to_cpu(x: torch.Tensor) -> torch.Tensor:
+    return x.detach().to("cpu")
+
+def _maybe_cast_attention_mask_uint8(row: Dict[str, torch.Tensor], enable: bool) -> None:
+    if not enable:
+        return
+    if "attention_mask" in row and row["attention_mask"].dtype == torch.long:
+        row["attention_mask"] = row["attention_mask"].to(torch.uint8)
+
+
+def _restore_attention_mask_long(batch: Dict[str, torch.Tensor]) -> None:
+    if "attention_mask" in batch and batch["attention_mask"].dtype == torch.uint8:
+        batch["attention_mask"] = batch["attention_mask"].long()
+
+
+# def _stack_rows(rows: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+#     if not rows:
+#         raise ValueError("empty rows")
+#     keys = rows[0].keys()
+#     out = {}
+#     for k in keys:
+#         out[k] = torch.stack([r[k] for r in rows], dim=0)
+#     return out
+
+def _stack_rows(
+    rows: List[Dict[str, torch.Tensor]],
+    pad_token_id: int,
+) -> Dict[str, torch.Tensor]:
+    if not rows:
+        raise ValueError("empty rows")
+
+    keys = rows[0].keys()
+    out = {}
+
+    for k in keys:
+        vals = [r[k] for r in rows]
+        shapes = [tuple(v.shape) for v in vals]
+
+        if all(s == shapes[0] for s in shapes):
+            out[k] = torch.stack(vals, dim=0)
+            continue
+
+        if all(v.dim() == 1 for v in vals):
+            max_len = max(v.size(0) for v in vals)
+
+            if k in ["input_ids", "responses"]:
+                cur_pad_value = pad_token_id
+            elif k in ["attention_mask", "response_mask", "loss_mask"]:
+                cur_pad_value = 0
+            elif k in ["position_ids"]:
+                cur_pad_value = 0
+            elif k in ["old_log_probs", "advantages", "returns", "values", "token_level_scores", "ref_log_prob"]:
+                cur_pad_value = 0.0
+            else:
+                raise RuntimeError(f"Variable-length field {k} has no pad rule")
+
+            padded = [
+                F.pad(v, (0, max_len - v.size(0)), value=cur_pad_value)
+                for v in vals
+            ]
+            out[k] = torch.stack(padded, dim=0)
+            continue
+
+        if all(v.dim() == 2 for v in vals):
+            max0 = max(v.size(0) for v in vals)
+            max1 = max(v.size(1) for v in vals)
+
+            if k in ["input_ids", "responses"]:
+                cur_pad_value = pad_token_id
+            else:
+                cur_pad_value = 0
+
+            padded = []
+            for v in vals:
+                pad = (0, max1 - v.size(1), 0, max0 - v.size(0))
+                padded.append(F.pad(v, pad, value=cur_pad_value))
+            out[k] = torch.stack(padded, dim=0)
+            continue
+
+        raise RuntimeError(f"Cannot stack key={k}: inconsistent shapes={shapes}")
+
+    return out
+
+def _gather_rows(batch_tensors: Dict[str, torch.Tensor], idx: List[int]) -> Dict[str, torch.Tensor]:
+    """
+    Select rows from a dict of (B, ...) tensors.
+    """
+    out = {}
+    idx_t = torch.tensor(idx, dtype=torch.long)
+    for k, v in batch_tensors.items():
+        if not torch.is_tensor(v):
+            continue
+        out[k] = v.index_select(0, idx_t)
+    return out
+
+
+# def _stack_items(items: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+#     """
+#     Stack a list of per-row dicts into a batch dict.
+#     Each item[k] should be a tensor of shape (...)
+#     """
+#     if not items:
+#         raise ValueError("No items to stack")
+
+#     keys = items[0].keys()
+#     out: Dict[str, torch.Tensor] = {}
+#     for k in keys:
+#         vals = [it[k] for it in items]
+#         out[k] = torch.stack(vals, dim=0)
+#     return out
+
+def _pad_and_stack_1d(vals, pad_value=0):
+    # vals: list[Tensor] with shape [L_i]
+    max_len = max(int(v.numel()) for v in vals)
+    out = []
+    for v in vals:
+        v = v.detach().cpu()
+        if v.numel() < max_len:
+            pad = torch.full((max_len - v.numel(),), pad_value, dtype=v.dtype)
+            v = torch.cat([v, pad], dim=0)
+        out.append(v)
+    return torch.stack(out, dim=0)
+
+def _pad_and_stack_2d(vals, pad_value=0):
+    # vals: list[Tensor] with shape [L_i, D] or [D, L_i] (we handle only [L_i, D])
+    max_len = max(int(v.shape[0]) for v in vals)
+    D = int(vals[0].shape[1])
+    out = []
+    for v in vals:
+        v = v.detach().cpu()
+        if v.shape[0] < max_len:
+            pad = torch.full((max_len - v.shape[0], D), pad_value, dtype=v.dtype)
+            v = torch.cat([v, pad], dim=0)
+        out.append(v)
+    return torch.stack(out, dim=0)
+
+def _stack_items(flat_items, pad_token_id: int = 0):
+    """
+    flat_items: list[dict[str, Tensor]]
+    Returns: dict[str, Tensor] stacked on dim=0.
+    Pads variable-length tensors on the RIGHT.
+    """
+    if len(flat_items) == 0:
+        return {}
+
+    keys = flat_items[0].keys()
+    out = {}
+
+    # per-key pad values (adjust if needed)
+    pad_value_by_key = {
+        "input_ids": pad_token_id,
+        "attention_mask": 0,
+        "position_ids": 0,
+        "responses": pad_token_id,
+        "prompts": pad_token_id,
+        "old_log_probs": 0.0,
+    }
+
+    for k in keys:
+        vals = [it[k] for it in flat_items]
+
+        # scalars / 1D fixed-size
+        if vals[0].dim() == 0:
+            out[k] = torch.stack([v.detach().cpu() for v in vals], dim=0)
+            continue
+
+        # 1D variable-length (most common: input_ids, attention_mask, position_ids, old_log_probs)
+        if vals[0].dim() == 1:
+            pad_val = pad_value_by_key.get(k, 0)
+            out[k] = _pad_and_stack_1d(vals, pad_value=pad_val)
+            continue
+
+        # 2D variable-length (rare in your RM path, but keep it)
+        if vals[0].dim() == 2 and vals[0].shape[1] == vals[0].shape[1]:
+            pad_val = pad_value_by_key.get(k, 0)
+            out[k] = _pad_and_stack_2d(vals, pad_value=pad_val)
+            continue
+
+        # fallback: require equal shapes
+        out[k] = torch.stack([v.detach().cpu() for v in vals], dim=0)
+
+    return out
+
+
+def _maybe_cast_masks(batch: Dict[str, torch.Tensor], cast_attention_mask_to_uint8: bool) -> None:
+    if not cast_attention_mask_to_uint8:
+        return
+    if "attention_mask" in batch and batch["attention_mask"].dtype == torch.long:
+        # uint8 is plenty for 0/1 mask
+        batch["attention_mask"] = batch["attention_mask"].to(torch.uint8)
+
+
+def _restore_masks_for_model(batch: Dict[str, torch.Tensor]) -> None:
+    """
+    If your model expects attention_mask long/bool, adjust here.
+    Many HF models accept int64 or bool; uint8 is usually OK, but
+    safest is convert back to long.
+    """
+    if "attention_mask" in batch and batch["attention_mask"].dtype == torch.uint8:
+        batch["attention_mask"] = batch["attention_mask"].long()
+
+
+def _get_group_key(uid: int, iter_id: Optional[int]) -> Tuple[int, Optional[int]]:
+    # Group by (uid, iter_id) if iter_id is provided; else group by uid only.
+    return (uid, iter_id)
+
+
+# ---------------------------
+# Base: trajectory store item
+# ---------------------------
+
+@dataclass
+class TrajItem:
+    uid: int
+    iter_id: Optional[int]  # for optional grouping by iteration
+    tensors: Dict[str, torch.Tensor]  # per-row tensors on CPU
+
+# ---------------------------
+# Buffer 1: CE replay (all trajectories)
+# ---------------------------
+
+class CEReplayBuffer:
+    """
+    Stores individual trajectories (pos+neg) with labels (acc).
+    For CE loss.
+    """
+    def __init__(
+        self,
+        capacity_traj: int,
+        keys_to_store: List[str],
+        cast_attention_mask_to_uint8: bool = True,
+        seed: int = 0,
+        pad_token_id: int = 0,
+    ):
+        self.pad_token_id = int(pad_token_id)
+        self.capacity = int(capacity_traj)
+        self.keys = list(keys_to_store)
+        self.cast_mask = cast_attention_mask_to_uint8
+        self.rng = random.Random(seed)
+        self._items: List[TrajItem] = []
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def add(self, data, *, iter_id: Optional[int] = None) -> None:
+        _ensure_uid_tensor(data)
+        B = data.batch["uid"].shape[0]
+
+        # select tensors to store
+        store_batch: Dict[str, torch.Tensor] = {}
+        for k in self.keys + ["uid"]:
+            if k in data.batch:
+                store_batch[k] = data.batch[k]
+        _maybe_cast_masks(store_batch, self.cast_mask)
+
+        uid_np = store_batch["uid"].to("cpu").numpy().astype(np.int64)
+
+        for i in range(B):
+            row = {}
+            for k, v in store_batch.items():
+                row[k] = _to_cpu_detached(v[i])
+            uid_i = int(uid_np[i])
+            self._items.append(TrajItem(uid=uid_i, iter_id=iter_id, tensors=row))
+
+        # evict oldest
+        overflow = len(self._items) - self.capacity
+        if overflow > 0:
+            self._items = self._items[overflow:]
+
+    def sample(self, num_traj: int, dp_world_size: int = 1):
+        if len(self._items) == 0:
+            return None
+        n = min(int(num_traj), len(self._items))
+        if dp_world_size > 1:
+            n = (n // dp_world_size) * dp_world_size
+        if n == 0:
+            return None
+        idx = self.rng.sample(range(len(self._items)), k=n)
+        items = [self._items[i].tensors for i in idx]
+        batch = _stack_items(items, pad_token_id=self.pad_token_id)
+        _restore_masks_for_model(batch)
+        return batch
+
+
+# ---------------------------
+# Buffer 2: IRL replay
+# ---------------------------
+
+@dataclass
+class GroupItem:
+    uid: int
+    iter_id: int
+    # list of per-trajectory row dicts (CPU tensors)
+    rows: List[Dict[str, torch.Tensor]]  # length = cands_per_uid
+
+class GroupReplayBuffer:
+    def __init__(
+        self,
+        capacity_groups: int,
+        cands_per_uid: int,
+        keys_to_store: List[str],
+        cast_attention_mask_to_uint8: bool = True,
+        seed: int = 0,
+        acc_key: str = "acc",
+        pos_threshold: float = 0.5,
+        require_both_pos_neg: bool = True,
+        pad_token_id: int = 0,
+    ):
+        self.pad_token_id = int(pad_token_id)
+        self.capacity = int(capacity_groups)
+        self.cands_per_uid = int(cands_per_uid)
+        self.keys = list(keys_to_store)
+        self.cast_mask = bool(cast_attention_mask_to_uint8)
+        self.acc_key = acc_key
+        self.pos_threshold = float(pos_threshold)
+        self.require_both_pos_neg = bool(require_both_pos_neg)
+        self.rng = random.Random(seed)
+
+        self._groups: List[GroupItem] = []
+        self._seen = set()  # (uid, iter_id)
+
+    def add_from_batch(self, data, *, iter_id: int) -> int:
+        _ensure_uid_tensor(data)
+        if self.acc_key not in data.batch:
+            raise KeyError(f"{self.acc_key} not found in data.batch")
+
+        uid = data.batch["uid"].detach().to("cpu").long()
+        acc = data.batch[self.acc_key].detach().to("cpu").float()
+        B = uid.shape[0]
+
+        store_batch: Dict[str, torch.Tensor] = {}
+        for k in self.keys + ["uid"]:
+            if k in data.batch:
+                store_batch[k] = data.batch[k]
+        if self.acc_key in data.batch and self.acc_key not in store_batch:
+            store_batch[self.acc_key] = data.batch[self.acc_key]
+
+        uid_np = uid.numpy().astype(np.int64)
+        by_uid: Dict[int, List[int]] = {}
+        for i in range(B):
+            u = int(uid_np[i])
+            by_uid.setdefault(u, []).append(i)
+
+        added = 0
+        for u, idxs in by_uid.items():
+            # require exact group size
+            if len(idxs) != self.cands_per_uid:
+                continue
+
+            # NEW: only keep groups with both pos and neg
+            if self.require_both_pos_neg:
+                acc_g = acc[idxs]
+                has_pos = bool((acc_g > self.pos_threshold).any().item())
+                has_neg = bool((acc_g <= self.pos_threshold).any().item())
+                if not (has_pos and has_neg):
+                    continue
+            # END NEW
+
+            key = (u, int(iter_id))
+            if key in self._seen:
+                continue
+
+            rows = []
+            for i in idxs:
+                row = {k: _to_cpu(v[i]) for k, v in store_batch.items()}
+                _maybe_cast_attention_mask_uint8(row, self.cast_mask)
+                row["uid"] = torch.tensor(u, dtype=torch.long)
+                rows.append(row)
+
+            self._groups.append(GroupItem(uid=u, iter_id=int(iter_id), rows=rows))
+            self._seen.add(key)
+            added += 1
+
+        # evict oldest
+        overflow = len(self._groups) - self.capacity
+        if overflow > 0:
+            evicted = self._groups[:overflow]
+            self._groups = self._groups[overflow:]
+            for g in evicted:
+                self._seen.discard((g.uid, g.iter_id))
+
+        return added
+
+    def sample_groups_as_flat_batch(self, num_groups: int) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Sample groups and return a flat trajectory batch (num_groups*cands_per_uid, ...).
+        This is what your existing update_rm() expects.
+        """
+        if len(self._groups) == 0:
+            return None
+        n = min(int(num_groups), len(self._groups))
+        idx = self.rng.sample(range(len(self._groups)), k=n)
+        chosen = [self._groups[i] for i in idx]
+
+        flat_rows: List[Dict[str, torch.Tensor]] = []
+        for g in chosen:
+            flat_rows.extend(g.rows)
+
+        batch = _stack_rows(flat_rows, pad_token_id=self.pad_token_id)
+        _restore_attention_mask_long(batch)
+
+        # sanity: ensure the flat batch size is divisible by cands_per_uid
+        assert batch["uid"].shape[0] % self.cands_per_uid == 0
+        return batch
+
+
+# ---------------------------
+# Buffer 3: Preference-pair replay (BT/DPO)
+# ---------------------------
+
+@dataclass
+class PairItem:
+    uid: int
+    iter_id: Optional[int]
+    pos: Dict[str, torch.Tensor]  # per-row tensors on CPU
+    neg: Dict[str, torch.Tensor]
+
+
+class PairReplayBuffer:
+    """
+    Stores explicit (pos, neg) pairs for BT/DPO loss.
+    This avoids the "no pairs" problem entirely.
+    """
+    def __init__(
+        self,
+        capacity_pairs: int,
+        keys_to_store: List[str],
+        cast_attention_mask_to_uint8: bool = True,
+        seed: int = 0,
+        acc_key: str = "acc",
+        pos_threshold: float = 0.5,
+        group_by_iter: bool = True,
+        max_pairs_per_group: int = 4,   # <-- recommended cap
+        pad_token_id: int = 0,
+    ):
+        self.pad_token_id = int(pad_token_id)
+        self.capacity = int(capacity_pairs)
+        self.keys = list(keys_to_store)
+        self.cast_mask = cast_attention_mask_to_uint8
+        self.rng = random.Random(seed)
+        self.acc_key = acc_key
+        self.pos_threshold = float(pos_threshold)
+        self.group_by_iter = bool(group_by_iter)
+        self.max_pairs_per_group = int(max_pairs_per_group)
+        self._pairs: List[PairItem] = []
+
+    def __len__(self) -> int:
+        return len(self._pairs)
+
+    def add_from_batch(self, data, *, iter_id: Optional[int] = None) -> int:
+        """
+        Create (pos, neg) pairs within each group and store them.
+        Returns number of pairs added.
+        """
+        _ensure_uid_tensor(data)
+        if self.acc_key not in data.batch:
+            raise KeyError(f"{self.acc_key} not found in data.batch")
+
+        uid = data.batch["uid"].detach().to("cpu").long()
+        acc = data.batch[self.acc_key].detach().to("cpu").float()
+
+        store_batch: Dict[str, torch.Tensor] = {}
+        for k in self.keys + ["uid", self.acc_key]:
+            if k in data.batch:
+                store_batch[k] = data.batch[k]
+        _maybe_cast_masks(store_batch, self.cast_mask)
+
+        # group indices by (uid, iter_id?) to avoid mixing across iterations (recommended)
+        groups: Dict[Tuple[int, Optional[int]], List[int]] = {}
+        B = uid.shape[0]
+        for i in range(B):
+            u = int(uid[i].item())
+            g_iter = iter_id if self.group_by_iter else None
+            gk = _get_group_key(u, g_iter)
+            groups.setdefault(gk, []).append(i)
+
+        added = 0
+        for (u, it), idxs in groups.items():
+            # split into pos/neg indices
+            pos = [i for i in idxs if float(acc[i].item()) > self.pos_threshold]
+            neg = [i for i in idxs if float(acc[i].item()) <= self.pos_threshold]
+            if not pos or not neg:
+                continue
+
+            # cap pairs per group to avoid skew
+            k = min(self.max_pairs_per_group, len(pos), len(neg))
+            # random match (without replacement)
+            self.rng.shuffle(pos)
+            self.rng.shuffle(neg)
+            pos = pos[:k]
+            neg = neg[:k]
+
+            for pi, ni in zip(pos, neg):
+                pos_row = {kk: _to_cpu_detached(store_batch[kk][pi]) for kk in store_batch.keys() if kk != "uid"}
+                neg_row = {kk: _to_cpu_detached(store_batch[kk][ni]) for kk in store_batch.keys() if kk != "uid"}
+
+                # uid stored separately
+                self._pairs.append(PairItem(uid=u, iter_id=it, pos=pos_row, neg=neg_row))
+                added += 1
+
+        # evict oldest
+        overflow = len(self._pairs) - self.capacity
+        if overflow > 0:
+            self._pairs = self._pairs[overflow:]
+
+        return added
+
+    def sample_pairs(self, num_pairs: int) -> Optional[List[PairItem]]:
+        if len(self._pairs) == 0:
+            return None
+        n = min(int(num_pairs), len(self._pairs))
+        idx = self.rng.sample(range(len(self._pairs)), k=n)
+        return [self._pairs[i] for i in idx]
+
+    def sample_as_flat_trajectories(self, num_pairs: int, dp_world_size: int = 1):
+        if len(self._pairs) == 0:
+            return None
+
+        n = min(int(num_pairs), len(self._pairs))
+
+        if dp_world_size > 1:
+            # need (2*n) % dp_world_size == 0
+            g = math.gcd(dp_world_size, 2)
+            step = dp_world_size // g  # for dp=8 -> step=4
+            n = (n // step) * step
+
+        if n == 0:
+            return None
+
+        pairs = self.sample_pairs(n)
+        if pairs is None:
+            return None
+
+        flat = []
+        for p in pairs:
+            pos_row = dict(p.pos)
+            neg_row = dict(p.neg)
+            pos_row["acc"] = torch.tensor(1.0, dtype=torch.float32)
+            neg_row["acc"] = torch.tensor(0.0, dtype=torch.float32)
+            pos_row["uid"] = torch.tensor(p.uid, dtype=torch.long)
+            neg_row["uid"] = torch.tensor(p.uid, dtype=torch.long)
+
+            # (recommended) contiguous [pos,neg] per pair
+            flat.append(pos_row)
+            flat.append(neg_row)
+
+        batch = _stack_items(flat, pad_token_id=self.pad_token_id)
+        _restore_masks_for_model(batch)
+        return batch
+
+
+# ---------------------------
+# Glue: build DataProto for RM update
+# ---------------------------
+
+def build_dataproto_for_rm(DataProtoCls, tensors: Dict[str, torch.Tensor], *, meta_n: Optional[int] = None):
+    """
+    DataProtoCls: your DataProto class (pass DataProto).
+    tensors: dict of (B, ...) tensors.
+    meta_n: set meta_info["n"] for metrics that assume n samples per prompt.
+    """
+    meta = {}
+    if meta_n is not None:
+        meta["n"] = int(meta_n)
+    return DataProtoCls.from_dict(tensors=tensors, meta_info=meta)
 
 
 import torch
@@ -431,6 +1038,18 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                         index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == 'rloo':
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        advantages, returns = core_algos.compute_rloo_outcome_advantage(token_level_rewards=token_level_rewards,
+                                                                        response_mask=response_mask,
+                                                                        index=index)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -643,7 +1262,50 @@ class RayPPOTrainer(object):
 
         self._create_dataloader()
         self._init_logger()
+
+        ######################### replay buffer start ########################################
+        cands_per_uid = int(self.config.actor_rollout_ref.rollout.n_agent) * int(self.config.actor_rollout_ref.rollout.n)
+
+        rm_store_keys = ["input_ids", "attention_mask", "position_ids", "prompts", "responses", "acc", "old_log_probs"]
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        self.ce_buf = CEReplayBuffer(
+            capacity_traj=200_000,
+            keys_to_store=rm_store_keys,
+            cast_attention_mask_to_uint8=True,
+            seed=0,
+            pad_token_id=pad_token_id
+        )
+
+        self.group_buf = GroupReplayBuffer(
+            capacity_groups=50_000,              # groups, not trajectories
+            cands_per_uid=cands_per_uid,         # 8 in your setting
+            keys_to_store=rm_store_keys,
+            cast_attention_mask_to_uint8=True,
+            seed=1,
+            acc_key="acc",
+            pad_token_id=pad_token_id
+        )
+
+        self.pair_buf = PairReplayBuffer(
+            capacity_pairs=200_000,
+            keys_to_store=rm_store_keys,     # must include acc because we overwrite, but you can omit acc in store_keys too
+            cast_attention_mask_to_uint8=True,
+            seed=2,
+            acc_key="acc",
+            pos_threshold=0.5,
+            group_by_iter=True,             # recommended: avoid cross-iteration mixing
+            max_pairs_per_group=4,          # cap recommendation
+            pad_token_id=pad_token_id
+        )
     
+        ######################### replay buffer end ########################################
+
     def _init_logger(self):
         from verl.utils.tracking import Tracking
         self.logger = Tracking(project_name=self.config.trainer.project_name,
@@ -901,6 +1563,8 @@ class RayPPOTrainer(object):
             self.use_critic = True
             
         elif self.config.algorithm.adv_estimator == 'grpo':
+            self.use_critic = False
+        elif self.config.algorithm.adv_estimator == 'rloo':
             self.use_critic = False
         else:
             raise NotImplementedError
@@ -1198,7 +1862,8 @@ class RayPPOTrainer(object):
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch_group_aware(batch, metrics=metrics)
+                    # self._balance_batch_group_aware(batch, metrics=metrics)
+                    # self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
@@ -1242,13 +1907,40 @@ class RayPPOTrainer(object):
                             rm_out = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(rm_out)
                             update_freq = self.config.reward_model.get("update_freq", 1)
-                            if self.config.reward_model.model.loss_type != "ce":
-                                batch = build_qbc_accbc(batch, num_rollout=self.config.reward_model.num_rollout)
+                            # if self.config.reward_model.model.loss_type != "ce":
+                            #     batch = build_qbc_accbc(batch, num_rollout=self.config.reward_model.num_rollout)
+
+                            iter_id = int(self.global_steps)
+                            self.ce_buf.add(batch, iter_id=iter_id)
+                            self.group_buf.add_from_batch(batch, iter_id=iter_id)
+                            self.pair_buf.add_from_batch(batch, iter_id=iter_id)
+                            dp_world_size = self.config.trainer.n_gpus_per_node
+
                             if self.global_steps % update_freq == 0:
                                 if self.config.reward_model.model.loss_type == "eto":
                                     rm_scores_upd = self.rm_wg.update_rm_eto(batch)
+                                elif self.config.reward_model.model.loss_type == "ce":
+                                    rm_scores_upd = self.rm_wg.update_rm(batch)
+                                    # tensors = self.ce_buf.sample(num_traj=self.config.data.train_batch_size,dp_world_size=dp_world_size)
+                                    # if tensors is not None:
+                                    #     data = DataProto.from_dict(tensors=tensors, meta_info={"batch_layout": "ungrouped"})
+                                    #     rm_scores_upd = self.rm_wg.update_rm(data)
+                                elif self.config.reward_model.model.loss_type == "dpo":
+                                    rm_scores_upd = self.rm_wg.update_rm(batch)
+                                    # tensors = self.pair_buf.sample_as_flat_trajectories(num_pairs=int(self.config.data.train_batch_size/2),dp_world_size=dp_world_size)  # 512 trajectories
+                                    # if tensors is not None:
+                                    #     data = DataProto.from_dict(tensors=tensors, meta_info={"n_samples": 2, "batch_layout": "contiguous_pairs"})
+                                    #     rm_scores_upd = self.rm_wg.update_rm(data)
+                                elif self.config.reward_model.model.loss_type == "irl":
+                                    tensors = self.group_buf.sample_groups_as_flat_batch(num_groups=int(self.config.data.train_batch_size/cands_per_prompt))
+                                    if tensors is not None:
+                                        data = DataProto.from_dict(tensors=tensors, meta_info={"n_samples": cands_per_prompt, "batch_layout": "contiguous_groups"})
+                                        rm_scores_upd = self.rm_wg.update_rm(data)
                                 else:
                                     rm_scores_upd = self.rm_wg.update_rm(batch)
+                                    
+
+                                    
 
                         # if self.use_rm:
                         #     # we first compute reward model score
@@ -1292,7 +1984,7 @@ class RayPPOTrainer(object):
                         
                         # Set token_level_scores based on reward_type
                         if reward_type in reward_mapping and self.use_rm:
-                            batch.batch["token_level_scores"] = batch.batch["rm_scores"]
+                            batch.batch["token_level_scores"] = batch.batch["rm_scores"] #+ format_reward_tensor
                             print(f"[INFO] Using reward shaping to shape {reward_type} for token_level_scores")
                         elif reward_type in reward_mapping:
                             selected_tensor = reward_mapping[reward_type]

@@ -27,7 +27,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from istar.rm_utils import (compute_ce_dpo_loss_rm, compute_bt_loss_rm, compute_irl_loss_rm,
-                          compute_detach_dpo_loss_rm, compute_eto_loss_rm, composite_rm_loss)
+                          compute_detach_dpo_loss_rm, compute_eto_loss_rm, composite_rm_loss, compute_ce_hyper_loss_rm, compute_bt_hyper_loss_rm)
 from verl import DataProto
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import (get_reverse_idx,
@@ -37,6 +37,17 @@ from verl.utils.ulysses import (gather_outpus_and_unpad,
 
 __all__ = ["DataParallelPRIMERewardModel"]
 
+
+def print_param_update(model, tag):
+    with torch.no_grad():
+        total_norm = 0.0
+        total_grad = 0.0
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                total_norm += p.data.float().norm().item()
+                if p.grad is not None:
+                    total_grad += p.grad.data.float().norm().item()
+        print(f"[{tag}] param_norm={total_norm:.6e}, grad_norm={total_grad:.6e}")
 
 class DataParallelISTARRewardModel:
     def __init__(self, config, reward_module: nn.Module, ref_module: nn.Module, reward_optimizer: optim.Optimizer):
@@ -278,8 +289,8 @@ class DataParallelISTARRewardModel:
             },
         )
 
+
     # def update_rm(self, data: DataProto):
-    #     # make sure we are in training mode
     #     self.reward_module.train()
     #     metrics = {}
 
@@ -287,80 +298,194 @@ class DataParallelISTARRewardModel:
 
     #     select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "acc", "prompts", "old_log_probs"]
 
+    #     # --- NEW: ensure uid exists in tensor batch ---
+    #     if "uid" not in data.batch.keys():
+    #         # uid originally lives in non_tensor_batch
+    #         import numpy as np
+    #         uid0 = np.asarray(data.non_tensor_batch["uid"])
+    #         # must be numeric; convert object->int64 safely
+    #         uid0 = uid0.astype(np.int64)
+    #         data.batch["uid"] = torch.from_numpy(uid0).long()
+    #     # --- END NEW ---
+
+    #     # make sure it gets selected
+    #     select_keys.append("uid")
+
     #     for key in ["Q_bc", "acc_bc"]:
     #         if key in data.batch.keys():
     #             select_keys.append(key)
 
     #     batch = data.select(batch_keys=select_keys).batch
-    #     # Split to make minibatch iterator for updating the actor
-    #     # See PPO paper for details. https://arxiv.org/abs/1707.06347
+    #     # # --- BEGIN: group-preserving batching for BT loss ---
+    #     # cands_per_prompt = 8  # = n_agent * n_roll in your config
+    #     # mbsz = self.config.micro_batch_size_per_gpu
+
+    #     # assert mbsz == cands_per_prompt, (
+    #     #     f"Expected micro_batch_size_per_gpu == cands_per_prompt, got {mbsz} vs {cands_per_prompt}"
+    #     # )
+
+    #     # # 1) sort the full tensordict by uid so each uid's 8 candidates are contiguous
+    #     # uid = batch["uid"]
+    #     # perm = torch.argsort(uid)
+    #     # batch = batch[perm]
+
+    #     # # 2) sanity: ensure every consecutive block of 8 has the same uid
+    #     # N = batch["uid"].shape[0]
+    #     # assert N % cands_per_prompt == 0, f"N={N} not divisible by cands_per_prompt={cands_per_prompt}"
+    #     # uid_block = batch["uid"].view(-1, cands_per_prompt)
+    #     # assert torch.all(uid_block.eq(uid_block[:, :1])), "UID blocks are not contiguous after sorting"
+
+    #     # # 3) Build mini-batches in units of uid-blocks (never split a uid-block)
+    #     # mini_bsz = self.config.mini_batch_size
+    #     # assert mini_bsz % cands_per_prompt == 0, (
+    #     #     f"mini_batch_size must be multiple of {cands_per_prompt} to preserve uid blocks, got {mini_bsz}"
+    #     # )
+    #     # blocks_per_mini = mini_bsz // cands_per_prompt
+    #     # num_blocks = N // cands_per_prompt
+
+    #     # dataloader = []
+    #     # for b0 in range(0, num_blocks, blocks_per_mini):
+    #     #     b1 = min(b0 + blocks_per_mini, num_blocks)
+    #     #     i0 = b0 * cands_per_prompt
+    #     #     i1 = b1 * cands_per_prompt
+    #     #     dataloader.append(batch[i0:i1])
+    #     # # --- END: group-preserving batching for BT loss ---
+
     #     dataloader = batch.split(self.config.mini_batch_size)
 
     #     rm_scores_lst = []
     #     q_lst = []
 
-    #     for batch_idx, data in enumerate(dataloader):
-    #         # split batch into micro_batches
-    #         mini_batch = data
+    #     total_loss_sum = 0.0
+    #     total_count = 0
+    #     total_pairs = 0
+
+    #     for batch_idx, mini in enumerate(dataloader):
     #         if self.config.use_dynamic_bsz:
     #             max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-    #             micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+    #             micro_batches, _ = rearrange_micro_batches(batch=mini, max_token_len=max_token_len)
     #         else:
-    #             micro_batches = mini_batch.split(self.config.micro_batch_size_per_gpu)
+    #             micro_batches = mini.split(self.config.micro_batch_size_per_gpu)
     #             self.gradient_accumulation = self.config.mini_batch_size // self.config.micro_batch_size_per_gpu
 
     #         self.reward_optimizer.zero_grad()
 
-    #         for data in micro_batches:
-    #             data = data.cuda()
-    #             attention_mask = data["attention_mask"]
-    #             acc = data["acc"]
+    #         for mb in micro_batches:
+    #             mb = mb.cuda()
+    #             attention_mask = mb["attention_mask"]
+    #             acc = mb["acc"]
 
-    #             prompt_ids = data["prompts"]
-    #             prompt_length = prompt_ids.shape[-1]
+    #             prompt_length = mb["prompts"].shape[-1]
+    #             response_mask = attention_mask[:, prompt_length:].float()
 
-    #             response_mask = attention_mask[:, prompt_length:]
-                
-
-    #             rm_score, q = self._forward_micro_batch(data, prompt_length)
+    #             rm_score, q = self._forward_micro_batch(mb, prompt_length)
 
     #             rm_scores_lst.append(rm_score)
     #             q_lst.append(q.detach())
 
+    #             ##############################debug_start###################################
+    #             # with torch.no_grad():
+    #             #     u, counts = torch.unique(mb["uid"], return_counts=True)
+    #             #     maxK = int(counts.max().item()) if counts.numel() else 0
+    #             #     both = 0
+    #             #     for uu in u:
+    #             #         idx = (mb["uid"] == uu).nonzero(as_tuple=False).squeeze(-1)
+    #             #         a = mb["acc"][idx].float()
+    #             #         if (a > 0.5).any() and (a <= 0.5).any():
+    #             #             both += 1
+    #             #     print("[BT-DEBUG][update_rm] mb_size", mb["uid"].numel(),
+    #             #         "unique_uids", u.numel(),
+    #             #         "max_uid_multiplicity", maxK,
+    #             #         "uids_with_both_labels", both)
+    #             # input()
+    #             ##############################debug_end###################################
+
     #             if self.config.model.loss_type == "ce":
     #                 dpo_loss = compute_ce_dpo_loss_rm(q, acc, response_mask=response_mask, beta=beta)
+
     #             elif self.config.model.loss_type == "dpo":
-    #                 dpo_loss, num_pairs = compute_bt_loss_rm(token_level_scores=q,acc=data["acc"],uid=data.non_tensor_batch["uid"],response_mask=response_mask,beta=beta,)
-    #                 # the implementation of dpo is actually detached, which means we have to know the average value of w/l reward before the update.
-    #             elif self.config.model.loss_type == "bon_acc":
-    #                 # change the original distribution of each sample to BoN distribution, then update reward model
-    #                 dpo_loss = compute_detach_dpo_loss_rm(
-    #                     q,
-    #                     acc,
-    #                     Q_bc=data["Q_bc"],
-    #                     acc_bc=data["acc_bc"],
+    #                 dpo_loss, num_pairs = compute_bt_loss_rm(
+    #                     token_level_scores=q,
+    #                     acc=acc,
+    #                     uid=mb["uid"],                  # <-- now tensor uid exists
     #                     response_mask=response_mask,
     #                     beta=beta,
-    #                     bon_mode="bon_acc",
     #                 )
+    #                 total_pairs += num_pairs
+                     
+
+    #             elif self.config.model.loss_type == "ce+dpo":
+    #                 dpo_loss_1 = compute_ce_dpo_loss_rm(q, acc, response_mask=response_mask, beta=beta)
+    #                 dpo_loss_2, num_pairs = compute_bt_loss_rm(
+    #                     token_level_scores=q,
+    #                     acc=acc,
+    #                     uid=mb["uid"],                  # <-- now tensor uid exists
+    #                     response_mask=response_mask,
+    #                     beta=beta,
+    #                 )
+    #                 dpo_loss = 0.5*dpo_loss_1+0.5*dpo_loss_2
+    #                 total_pairs += num_pairs
+
+    #             elif self.config.model.loss_type == "irl":
+    #                 dpo_loss, num_pairs = compute_irl_loss_rm(
+    #                     token_level_scores=q,
+    #                     acc=acc,
+    #                     uid=mb["uid"],                  # <-- now tensor uid exists
+    #                     response_mask=response_mask,
+    #                     beta=beta,
+    #                 )
+    #                 total_pairs += num_pairs
+
+    #             elif self.config.model.loss_type == "irl+dpo":
+    #                 dpo_loss_1, num_pairs = compute_irl_loss_rm(
+    #                     token_level_scores=q,
+    #                     acc=acc,
+    #                     uid=mb["uid"],                  # <-- now tensor uid exists
+    #                     response_mask=response_mask,
+    #                     beta=beta,
+    #                 )
+    #                 total_pairs += num_pairs
+
+    #                 dpo_loss_2, num_pairs = compute_bt_loss_rm(
+    #                     token_level_scores=q,
+    #                     acc=acc,
+    #                     uid=mb["uid"],                  # <-- now tensor uid exists
+    #                     response_mask=response_mask,
+    #                     beta=beta,
+    #                 )
+    #                 dpo_loss = 0.5*dpo_loss_1+0.5*dpo_loss_2
+
+    #             elif self.config.model.loss_type == "composite":
+    #                 dpo_loss, additional_metric = composite_rm_loss(
+    #                     token_level_scores=q,
+    #                     acc=acc,
+    #                     uid=mb["uid"],
+    #                     response_mask=response_mask,
+    #                     beta=beta,
+    #                 )
+    #                 metrics.update(additional_metric)
+                
+    #             elif self.config.model.loss_type == "bon_acc":
+    #                 dpo_loss = compute_detach_dpo_loss_rm(
+    #                     q, acc, Q_bc=mb["Q_bc"], acc_bc=mb["acc_bc"],
+    #                     response_mask=response_mask, beta=beta, bon_mode="bon_acc",
+    #                 )
+
     #             elif self.config.model.loss_type == "bon_rm":
     #                 dpo_loss = compute_detach_dpo_loss_rm(
-    #                     q,
-    #                     acc,
-    #                     Q_bc=data["Q_bc"],
-    #                     acc_bc=data["acc_bc"],
-    #                     response_mask=response_mask,
-    #                     beta=beta,
-    #                     bon_mode="bon_rm",
+    #                     q, acc, Q_bc=mb["Q_bc"], acc_bc=mb["acc_bc"],
+    #                     response_mask=response_mask, beta=beta, bon_mode="bon_rm",
     #                 )
     #             else:
     #                 raise NotImplementedError
 
-    #             data = {"reward_model/dpo_loss": dpo_loss.detach().item()}
+    #             append_to_dict(metrics, {"reward_model/dpo_loss": float(dpo_loss.detach().item())})
+
+    #             mbsz = attention_mask.shape[0]
+    #             total_loss_sum += float(dpo_loss.detach().item()) * mbsz
+    #             total_count += mbsz
 
     #             if self.config.use_dynamic_bsz:
-    #                 # relative to the dynamic bsz
-    #                 # loss = dpo_loss * (len(data) / self.config.ppo_mini_batch_size)
     #                 mbsz = attention_mask.shape[0]
     #                 loss = dpo_loss * (mbsz / self.config.ppo_mini_batch_size)
     #             else:
@@ -368,24 +493,21 @@ class DataParallelISTARRewardModel:
 
     #             loss.backward()
 
-    #             append_to_dict(metrics, data)
-
     #         grad_norm = self._optimizer_step()
-    #         data = {"reward_model/grad_norm": grad_norm.detach().item()}
-    #         append_to_dict(metrics, data)
+    #         append_to_dict(metrics, {"reward_model/grad_norm": float(grad_norm.detach().item())})
+
     #     self.reward_optimizer.zero_grad()
 
-    #     rm_scores = torch.concat(rm_scores_lst, dim=0)
-    #     q = torch.concat(q_lst, dim=0)
+    #     rm_scores = torch.cat(rm_scores_lst, dim=0)
+    #     q_all = torch.cat(q_lst, dim=0)
 
     #     rm_scores = self.istar_norm(rm_scores)
-
-    #     metrics.update(
-    #         {
-    #             "reward_model/reward": rm_scores.sum(dim=-1).mean().item(),
-    #             "reward_model/raw_reward": q.sum(dim=-1).mean().item(),
-    #         }
-    #     )
+    #     metrics.update({
+    #         "reward_model/num_pairs": total_pairs,
+    #         "reward_model/loss": total_loss_sum / max(total_count, 1),
+    #         "reward_model/reward": rm_scores.sum(dim=-1).mean().item(),
+    #         "reward_model/raw_reward": q_all.sum(dim=-1).mean().item(),
+    #     })
 
     #     return rm_scores, metrics
 
@@ -395,19 +517,16 @@ class DataParallelISTARRewardModel:
 
         beta = self.config.model.get("beta_train", 0.05)
 
+        # keep old_log_probs "just in case"
         select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "acc", "prompts", "old_log_probs"]
 
-        # --- NEW: ensure uid exists in tensor batch ---
+        # --- ensure uid exists in tensor batch ---
         if "uid" not in data.batch.keys():
-            # uid originally lives in non_tensor_batch
             import numpy as np
-            uid0 = np.asarray(data.non_tensor_batch["uid"])
-            # must be numeric; convert object->int64 safely
-            uid0 = uid0.astype(np.int64)
+            uid0 = np.asarray(data.non_tensor_batch["uid"]).astype(np.int64)
             data.batch["uid"] = torch.from_numpy(uid0).long()
-        # --- END NEW ---
+        # --- end ensure uid ---
 
-        # make sure it gets selected
         select_keys.append("uid")
 
         for key in ["Q_bc", "acc_bc"]:
@@ -415,41 +534,6 @@ class DataParallelISTARRewardModel:
                 select_keys.append(key)
 
         batch = data.select(batch_keys=select_keys).batch
-        # # --- BEGIN: group-preserving batching for BT loss ---
-        # cands_per_prompt = 8  # = n_agent * n_roll in your config
-        # mbsz = self.config.micro_batch_size_per_gpu
-
-        # assert mbsz == cands_per_prompt, (
-        #     f"Expected micro_batch_size_per_gpu == cands_per_prompt, got {mbsz} vs {cands_per_prompt}"
-        # )
-
-        # # 1) sort the full tensordict by uid so each uid's 8 candidates are contiguous
-        # uid = batch["uid"]
-        # perm = torch.argsort(uid)
-        # batch = batch[perm]
-
-        # # 2) sanity: ensure every consecutive block of 8 has the same uid
-        # N = batch["uid"].shape[0]
-        # assert N % cands_per_prompt == 0, f"N={N} not divisible by cands_per_prompt={cands_per_prompt}"
-        # uid_block = batch["uid"].view(-1, cands_per_prompt)
-        # assert torch.all(uid_block.eq(uid_block[:, :1])), "UID blocks are not contiguous after sorting"
-
-        # # 3) Build mini-batches in units of uid-blocks (never split a uid-block)
-        # mini_bsz = self.config.mini_batch_size
-        # assert mini_bsz % cands_per_prompt == 0, (
-        #     f"mini_batch_size must be multiple of {cands_per_prompt} to preserve uid blocks, got {mini_bsz}"
-        # )
-        # blocks_per_mini = mini_bsz // cands_per_prompt
-        # num_blocks = N // cands_per_prompt
-
-        # dataloader = []
-        # for b0 in range(0, num_blocks, blocks_per_mini):
-        #     b1 = min(b0 + blocks_per_mini, num_blocks)
-        #     i0 = b0 * cands_per_prompt
-        #     i1 = b1 * cands_per_prompt
-        #     dataloader.append(batch[i0:i1])
-        # # --- END: group-preserving batching for BT loss ---
-
         dataloader = batch.split(self.config.mini_batch_size)
 
         rm_scores_lst = []
@@ -465,7 +549,9 @@ class DataParallelISTARRewardModel:
                 micro_batches, _ = rearrange_micro_batches(batch=mini, max_token_len=max_token_len)
             else:
                 micro_batches = mini.split(self.config.micro_batch_size_per_gpu)
-                self.gradient_accumulation = self.config.mini_batch_size // self.config.micro_batch_size_per_gpu
+
+                # <<< CHANGED: use actual number of micro-batches (replay may be smaller than config.mini_batch_size)
+                self.gradient_accumulation = max(1, len(micro_batches))
 
             self.reward_optimizer.zero_grad()
 
@@ -482,54 +568,70 @@ class DataParallelISTARRewardModel:
                 rm_scores_lst.append(rm_score)
                 q_lst.append(q.detach())
 
-                ##############################debug_start###################################
-                # with torch.no_grad():
-                #     u, counts = torch.unique(mb["uid"], return_counts=True)
-                #     maxK = int(counts.max().item()) if counts.numel() else 0
-                #     both = 0
-                #     for uu in u:
-                #         idx = (mb["uid"] == uu).nonzero(as_tuple=False).squeeze(-1)
-                #         a = mb["acc"][idx].float()
-                #         if (a > 0.5).any() and (a <= 0.5).any():
-                #             both += 1
-                #     print("[BT-DEBUG][update_rm] mb_size", mb["uid"].numel(),
-                #         "unique_uids", u.numel(),
-                #         "max_uid_multiplicity", maxK,
-                #         "uids_with_both_labels", both)
-                # input()
-                ##############################debug_end###################################
-
                 if self.config.model.loss_type == "ce":
                     dpo_loss = compute_ce_dpo_loss_rm(q, acc, response_mask=response_mask, beta=beta)
+                elif self.config.model.loss_type == "ce_full":
+                    dpo_loss = compute_ce_hyper_loss_rm(q, acc, response_mask=response_mask, beta=beta, m=self.config.micro_batch_size_per_gpu,uid=mb["uid"])
 
                 elif self.config.model.loss_type == "dpo":
                     dpo_loss, num_pairs = compute_bt_loss_rm(
                         token_level_scores=q,
                         acc=acc,
-                        uid=mb["uid"],                  # <-- now tensor uid exists
+                        uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
                     )
                     total_pairs += num_pairs
-                     
+                
+                elif self.config.model.loss_type == "dpo_full":
+                    dpo_loss, num_pairs = compute_bt_hyper_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                    )
+                    total_pairs += num_pairs 
+
+                elif self.config.model.loss_type == "ce+dpo_full":
+                    ce_loss = compute_ce_hyper_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        response_mask=response_mask,
+                        beta=beta,
+                        m=self.config.micro_batch_size_per_gpu,
+                    )
+
+                    bt_loss, num_valid_uid_groups = compute_bt_hyper_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                    )
+
+                    dpo_loss = ce_loss + self.config.lambda_dpo * bt_loss
+                    total_pairs += num_valid_uid_groups 
+
+                
 
                 elif self.config.model.loss_type == "ce+dpo":
                     dpo_loss_1 = compute_ce_dpo_loss_rm(q, acc, response_mask=response_mask, beta=beta)
                     dpo_loss_2, num_pairs = compute_bt_loss_rm(
                         token_level_scores=q,
                         acc=acc,
-                        uid=mb["uid"],                  # <-- now tensor uid exists
+                        uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
                     )
-                    dpo_loss = 0.5*dpo_loss_1+0.5*dpo_loss_2
+                    dpo_loss = dpo_loss_1 + self.config.lambda_dpo * dpo_loss_2
                     total_pairs += num_pairs
 
                 elif self.config.model.loss_type == "irl":
                     dpo_loss, num_pairs = compute_irl_loss_rm(
                         token_level_scores=q,
                         acc=acc,
-                        uid=mb["uid"],                  # <-- now tensor uid exists
+                        uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
                     )
@@ -539,7 +641,7 @@ class DataParallelISTARRewardModel:
                     dpo_loss_1, num_pairs = compute_irl_loss_rm(
                         token_level_scores=q,
                         acc=acc,
-                        uid=mb["uid"],                  # <-- now tensor uid exists
+                        uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
                     )
@@ -548,11 +650,11 @@ class DataParallelISTARRewardModel:
                     dpo_loss_2, num_pairs = compute_bt_loss_rm(
                         token_level_scores=q,
                         acc=acc,
-                        uid=mb["uid"],                  # <-- now tensor uid exists
+                        uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
                     )
-                    dpo_loss = 0.5*dpo_loss_1+0.5*dpo_loss_2
+                    dpo_loss = 0.5 * dpo_loss_1 + 0.5 * dpo_loss_2
 
                 elif self.config.model.loss_type == "composite":
                     dpo_loss, additional_metric = composite_rm_loss(
@@ -563,7 +665,7 @@ class DataParallelISTARRewardModel:
                         beta=beta,
                     )
                     metrics.update(additional_metric)
-                
+
                 elif self.config.model.loss_type == "bon_acc":
                     dpo_loss = compute_detach_dpo_loss_rm(
                         q, acc, Q_bc=mb["Q_bc"], acc_bc=mb["acc_bc"],
@@ -585,17 +687,31 @@ class DataParallelISTARRewardModel:
                 total_count += mbsz
 
                 if self.config.use_dynamic_bsz:
-                    mbsz = attention_mask.shape[0]
                     loss = dpo_loss * (mbsz / self.config.ppo_mini_batch_size)
                 else:
+                    # uses the corrected self.gradient_accumulation above
                     loss = dpo_loss / self.gradient_accumulation
 
+                # print_param_update(self.reward_module, "before backward")
                 loss.backward()
-
+            # print_param_update(self.reward_module, "after backward")
             grad_norm = self._optimizer_step()
             append_to_dict(metrics, {"reward_model/grad_norm": float(grad_norm.detach().item())})
-
+        # print_param_update(self.reward_module, "after step")
+        # input()
         self.reward_optimizer.zero_grad()
+
+        # <<< CHANGED: handle empty replay (no batches processed) safely
+        if len(rm_scores_lst) == 0:
+            # Return empty tensors + metrics; caller may skip using rm_scores.
+            empty_scores = torch.zeros((0, 1), device=torch.device("cpu"))
+            metrics.update({
+                "reward_model/num_pairs": 0,
+                "reward_model/loss": 0.0,
+                "reward_model/reward": 0.0,
+                "reward_model/raw_reward": 0.0,
+            })
+            return empty_scores, metrics
 
         rm_scores = torch.cat(rm_scores_lst, dim=0)
         q_all = torch.cat(q_lst, dim=0)
@@ -609,7 +725,6 @@ class DataParallelISTARRewardModel:
         })
 
         return rm_scores, metrics
-
 
 
     def update_rm_eto(self, data: DataProto):
@@ -1182,7 +1297,7 @@ class DataParallelPotentialRewardModel:
                         response_mask=response_mask,
                         beta=beta,
                     )
-                    dpo_loss = 0.5 * l1 + 0.5 * l2
+                    dpo_loss = l1 + 0.1 * l2
                     total_pairs += num_pairs
 
                 elif self.config.model.loss_type == "irl":
@@ -1255,6 +1370,18 @@ class DataParallelPotentialRewardModel:
             append_to_dict(metrics, {"reward_model/grad_norm": float(grad_norm.detach().item())})
 
         self.reward_optimizer.zero_grad()
+
+        # <<< CHANGED: handle empty replay (no batches processed) safely
+        if len(total_reward_lst) == 0:
+            # Return empty tensors + metrics; caller may skip using rm_scores.
+            empty_scores = torch.zeros((0, 1), device=torch.device("cpu"))
+            metrics.update({
+                "reward_model/num_pairs": 0,
+                "reward_model/loss": 0.0,
+                "reward_model/reward": 0.0,
+                "reward_model/raw_reward": 0.0,
+            })
+            return empty_scores, metrics
 
         token_total = torch.cat(total_reward_lst, dim=0)
         token_process = torch.cat(process_reward_lst, dim=0)

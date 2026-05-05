@@ -30,10 +30,6 @@ class AsyncVLLMClient:
         self.client = AsyncOpenAI(api_key="EMPTY", base_url=self.base_url)
         self.log = logging.getLogger(self.__class__.__name__)
 
-    async def aclose(self):
-        # OpenAI python supports async close on the async client
-        await self.client.close()
-    
     async def generate_text(self, prompt: str, max_tokens: int = 2048) -> Optional[str]:
         try:
             resp = await self.client.chat.completions.create(
@@ -42,8 +38,6 @@ class AsyncVLLMClient:
                 max_tokens=max_tokens,
             )
             return resp.choices[0].message.content
-        except asyncio.CancelledError:
-            raise
         except Exception as e:
             self.log.error(f"Chat error: {e}")
             return None
@@ -51,44 +45,6 @@ class AsyncVLLMClient:
 # ============================================================================
 # Async Batch Processing Functions  
 # ============================================================================
-
-# async def run_batch(
-#     samples: List[Tuple[str, List[str], str]],
-#     client: AsyncVLLMClient,
-#     concurrency: int = 16,
-#     max_tokens: int = 2048,
-#     max_retries: int = 2,
-#     judge_mode: str = "turn",
-# ):
-#     sem = asyncio.Semaphore(concurrency)
-
-#     async def one_job(idx: int, sample):
-#         prompt, turns, ground_truth = sample
-        
-#         if judge_mode == "outcome":
-#             judge_prompt = JudgeEvaluator.create_outcome_judge_prompt(prompt, turns, ground_truth)
-#         else:  # default to "turn"
-#             judge_prompt = JudgeEvaluator.create_turn_judge_prompt(prompt, turns, ground_truth)
-#         for attempt in range(max_retries + 1):
-#             try:
-#                 async with sem:
-#                     text = await client.generate_text(judge_prompt, max_tokens=max_tokens)
-#                 return idx, text
-#             except Exception:
-#                 if attempt >= max_retries:
-#                     return idx, None
-#                 await asyncio.sleep(0.1)
-
-#     tasks = [asyncio.create_task(one_job(i, s)) for i, s in enumerate(samples)]
-    
-#     # Use tqdm to track async batch completion progress
-#     results = []
-#     for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing batch"):
-#         result = await coro
-#         results.append(result)
-    
-#     results.sort(key=lambda x: x[0])
-#     return [r[1] for r in results]
 
 async def run_batch(
     samples: List[Tuple[str, List[str], str]],
@@ -102,37 +58,31 @@ async def run_batch(
 
     async def one_job(idx: int, sample):
         prompt, turns, ground_truth = sample
+        
         if judge_mode == "outcome":
             judge_prompt = JudgeEvaluator.create_outcome_judge_prompt(prompt, turns, ground_truth)
-        else:
+        else:  # default to "turn"
             judge_prompt = JudgeEvaluator.create_turn_judge_prompt(prompt, turns, ground_truth)
-
         for attempt in range(max_retries + 1):
-            async with sem:
-                text = await client.generate_text(judge_prompt, max_tokens=max_tokens)
-            if text is not None:
+            try:
+                async with sem:
+                    text = await client.generate_text(judge_prompt, max_tokens=max_tokens)
                 return idx, text
-            if attempt < max_retries:
+            except Exception:
+                if attempt >= max_retries:
+                    return idx, None
                 await asyncio.sleep(0.1)
-        return idx, None
 
     tasks = [asyncio.create_task(one_job(i, s)) for i, s in enumerate(samples)]
-
+    
+    # Use tqdm to track async batch completion progress
     results = []
-    try:
-        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing batch"):
-            results.append(await fut)
-    finally:
-        # Cancel any leftover tasks (if we exited early due to error/cancel)
-        pending = [t for t in tasks if not t.done()]
-        for t in pending:
-            t.cancel()
-        # IMPORTANT: retrieve exceptions to avoid "Task exception was never retrieved"
-        await asyncio.gather(*tasks, return_exceptions=True)
-
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing batch"):
+        result = await coro
+        results.append(result)
+    
     results.sort(key=lambda x: x[0])
     return [r[1] for r in results]
-
 
 
 # ============================================================================
@@ -188,18 +138,26 @@ async def amain(args):
         )
         print(f"Completed batch processing: {len(judge_texts)} results")
 
-
-    # finally:
-    #     # Essential cleanup to prevent connection buildup
-    #     if hasattr(client, 'client'):
-    #         try:
-    #             await client.client.aclose()
-    #         except:
-    #             pass
-
+        # # Process results
+        # print(f"\nProcessing {len(judge_texts)} results...")
+        # for i, ((_, turns, _), judge_text) in enumerate(zip(samples, judge_texts), 1):
+        #     print(f"\nSAMPLE {i}:")
+        #     print("-" * 80)
+        #     print(f"Num of Turns: {len(turns)}")
+            
+        #     if args.judge_mode == "outcome":
+        #         score = JudgeEvaluator.extract_outcome_score_from_judge_response(judge_text or "")
+        #         print(f"Outcome Score: {score}")
+        #     else:  # turn mode
+        #         scores = JudgeEvaluator.extract_turn_scores_from_judge_response(judge_text or "", len(turns))
+        #         print(f"Turn Scores: {scores}")
     finally:
-        await client.aclose()
-
+        # Essential cleanup to prevent connection buildup
+        if hasattr(client, 'client'):
+            try:
+                await client.client.aclose()
+            except:
+                pass
 
 
 # ============================================================================

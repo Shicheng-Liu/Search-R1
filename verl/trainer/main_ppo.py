@@ -102,10 +102,14 @@ class RewardManager():
             prompt_length = prompt_ids.shape[-1]
 
             valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+            if isinstance(valid_prompt_length, torch.Tensor):
+                valid_prompt_length = int(valid_prompt_length.item())
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
             response_ids = data_item.batch['responses']
             valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+            if isinstance(valid_response_length, torch.Tensor):
+                valid_response_length = int(valid_response_length.item())
             valid_response_ids = response_ids[:valid_response_length]
 
             # decode
@@ -115,6 +119,12 @@ class RewardManager():
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             decoded_full_texts = data_item.meta_info['decoded_full_texts'][i]
             decoded_turn_texts = data_item.meta_info['decoded_turn_texts'][i]
+
+            # guard decoded_turn_texts without changing logic
+            if decoded_turn_texts is None:
+                decoded_turn_texts = []
+            elif not isinstance(decoded_turn_texts, (list, tuple)):
+                decoded_turn_texts = []
 
             # select rm_score
             data_source = data_item.non_tensor_batch['data_source']
@@ -132,6 +142,7 @@ class RewardManager():
             format_score = compute_format_score(solution_str=sequences_str)
             retrieval_score = compute_retrieval_score(solution_str=sequences_str, ground_truth=ground_truth)
             mixed_outcome_score = compute_mixed_outcome_score(solution_str=sequences_str, ground_truth=ground_truth)
+            final_em_format_score = 0.0
             try:
                 final_turn = decoded_turn_texts[-1]
                 if final_turn:
@@ -165,9 +176,24 @@ class RewardManager():
                 avg_step_retrieval_format_reward_tensor[i, valid_response_length - 1] = step_retrieval_format_reward_tensor[i, :].sum(dim=-1) / (data.meta_info['num_turns'][i] - 1)
             
             # Collect batch data for judge processing if needed
+            # if is_judge:
+            #     batch_mid_turns.append(decoded_turn_texts[:-1])
+            #     batch_final_turns.append(decoded_turn_texts[-1])
+            #     batch_solutions.append(decoded_full_texts)
+            #     batch_ground_truths.append(ground_truth)
+            #     batch_indices.append(i)
+
             if is_judge:
-                batch_mid_turns.append(decoded_turn_texts[:-1])
-                batch_final_turns.append(decoded_turn_texts[-1])
+                try:
+                    batch_mid_turns.append(decoded_turn_texts[:-1])
+                except (IndexError, TypeError, KeyError):
+                    batch_mid_turns.append([])
+
+                try:
+                    batch_final_turns.append(decoded_turn_texts[-1])
+                except (IndexError, TypeError, KeyError):
+                    batch_final_turns.append("")
+
                 batch_solutions.append(decoded_full_texts)
                 batch_ground_truths.append(ground_truth)
                 batch_indices.append(i)

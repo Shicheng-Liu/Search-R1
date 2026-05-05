@@ -1,4 +1,4 @@
-WORK_DIR=your/work/dir
+WORK_DIR=/efs/shicheng/Search-R1
 LOCAL_DIR=$WORK_DIR/data/nq_hotpotqa_train
 
 ## process multiple dataset search format train file
