@@ -252,26 +252,32 @@ class ISTARRewardModelWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.reward_optimizer)
 
-        self.rm = DataParallelISTARRewardModel(
-            config=self.config,
-            reward_module=self.reward_module,
-            ref_module=self.ref_module,
-            reward_optimizer=self.reward_optimizer,
-        )
+        if self.config.shaping_method == "log-frac":
+            self.rm = DataParallelISTARRewardModel(
+                config=self.config,
+                reward_module=self.reward_module,
+                ref_module=self.ref_module,
+                reward_optimizer=self.reward_optimizer,
+            )
 
-        # self.rm = DataParallelPotentialRewardModel(
-        #     config=self.config,
-        #     reward_module=self.reward_module,
-        #     ref_module=self.ref_module,
-        #     reward_optimizer=self.reward_optimizer,
-        # )
+        elif self.config.shaping_method == "potential":
+            self.rm = DataParallelPotentialRewardModel(
+                config=self.config,
+                reward_module=self.reward_module,
+                ref_module=self.ref_module,
+                reward_optimizer=self.reward_optimizer,
+            )
 
-        # self.rm = DataParallelLMHeadISTARRewardModel(
-        #     config=self.config,
-        #     reward_module=self.reward_module,
-        #     ref_module=self.ref_module,
-        #     reward_optimizer=self.reward_optimizer,
-        # )
+        elif self.config.shaping_method == "linear":
+            self.rm = DataParallelLMHeadISTARRewardModel(
+                config=self.config,
+                reward_module=self.reward_module,
+                ref_module=self.ref_module,
+                reward_optimizer=self.reward_optimizer,
+            )
+
+        else:
+            raise NotImplementedError(f"Unknown shaping method {self.config.shaping_method}")
 
         self.flops_counter = FlopsCounter(self.reward_model_config)
         self.checkpoint_manager = FSDPCheckpointManager(
@@ -395,7 +401,7 @@ class ISTARRewardModelWorker(Worker):
 
             # compute only when meaningful & valid
             if (
-                loss_type in {"dpo", "ce+dpo", "irl+dpo"} and
+                loss_type in {"dpo", "dpo_full", "ce+dpo", "ce+dpo_full", "irl+dpo"} and
                 batch_layout in {"contiguous_groups", "contiguous_pairs"} and
                 isinstance(n_samples, int) and n_samples >= 2 and
                 "prompts" in data.batch and "attention_mask" in data.batch and "acc" in data.batch

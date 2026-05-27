@@ -53,6 +53,7 @@ def compute_ce_hyper_loss_rm(
     m=8,
     uid=None,
     gamma=1.0,
+    lambda_indirect=0.0,
     debug=False,
 ):
     """
@@ -135,7 +136,6 @@ def compute_ce_hyper_loss_rm(
 
     # total_loss = direct_ce_loss + implicit_ce_loss
 
-    lambda_indirect = 1e-2
     traj_scores_grouped = (token_level_scores * response_mask).sum(dim=1).view(B, m)
     traj_baseline = traj_scores_grouped.mean(dim=1, keepdim=True)
     implicit_scalar = traj_scores_grouped - traj_baseline
@@ -270,7 +270,7 @@ def compute_ce_hyper_loss_rm(
                       f"{(lambda_indirect *implicit_norm / (direct_norm + 1e-12)).item():.6e}")
                 print(f"grad cosine direct vs implicit: {cosine.item():.6f}")
 
-                total_grad = direct_grad + implicit_grad
+                total_grad = direct_grad + lambda_indirect * implicit_grad
                 tg = total_grad[mask].flatten()
                 print(f"total_grad norm: {tg.norm().item():.6e}")
 
@@ -431,8 +431,9 @@ def compute_bt_loss_rm(token_level_scores, acc, uid, response_mask, beta=0.05, l
     uid = uid.to(device=device)
 
     # length-normalized sequence score
-    lens = response_mask.sum(dim=-1).clamp_min(1.0)
-    q_seq = (token_level_scores * response_mask).sum(dim=-1) / lens
+    # lens = response_mask.sum(dim=-1).clamp_min(1.0)
+    # q_seq = (token_level_scores * response_mask).sum(dim=-1) / lens
+    q_seq = (token_level_scores * response_mask).sum(dim=-1) 
 
     uid_losses = []
     for u in torch.unique(uid):
@@ -460,6 +461,120 @@ def compute_bt_loss_rm(token_level_scores, acc, uid, response_mask, beta=0.05, l
     reg = lam * (q_seq ** 2).mean()
     return bt_loss + reg, len(uid_losses)
 
+# def compute_bt_hyper_loss_rm(
+#     token_level_scores,
+#     acc,
+#     uid,
+#     response_mask,
+#     beta=0.05,
+#     lam=1e-3,
+#     lambda_indirect=0.0
+# ):
+#     """
+#     Full BT / DPO-style hyper-loss:
+#       1) direct pairwise BT loss
+#       2) implicit dependency term via surrogate loss
+
+#     Args:
+#         token_level_scores: [N, L]
+#         acc:                [N]       binary success labels
+#         uid:                [N]       prompt/group ids
+#         response_mask:      [N, L]
+#         beta:               scaling used in the direct pairwise loss and implicit surrogate
+#         lam:                L2 regularizer coefficient
+
+#     Returns:
+#         total_loss: scalar
+#         num_valid_uid_groups: int
+#     """
+#     device = token_level_scores.device
+#     dtype = token_level_scores.dtype
+
+#     response_mask = response_mask.to(device=device, dtype=dtype)
+#     acc = acc.to(device=device, dtype=dtype)
+#     uid = uid.to(device=device)
+
+#     # ------------------------------------------------------------
+#     # Per-trajectory sequence score
+#     # ------------------------------------------------------------
+#     lens = response_mask.sum(dim=-1).clamp_min(1.0)  # [N]
+#     q_seq = (token_level_scores * response_mask).sum(dim=-1) / lens  # [N]
+
+#     # For implicit surrogate, use the same beta-scaled reward convention
+#     scaled_token_scores = beta * token_level_scores
+#     scaled_q_seq = (scaled_token_scores * response_mask).sum(dim=-1) / lens  # [N]
+
+#     uid_direct_losses = []
+#     uid_implicit_losses = []
+
+#     unique_uid = torch.unique(uid)
+
+#     for u in unique_uid:
+#         idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)
+
+#         q_g = q_seq[idxs]                 # [g]
+#         q_g_scaled = scaled_q_seq[idxs]   # [g]
+#         a_g = acc[idxs]                   # [g]
+
+#         # center per-uid to remove offset freedom, matching your direct code
+#         q_g = q_g - q_g.mean()
+#         q_g_scaled = q_g_scaled - q_g_scaled.mean()
+
+#         pos_mask = a_g > 0.5
+#         neg_mask = ~pos_mask
+
+#         q_pos = q_g[pos_mask]                   # [P]
+#         q_neg = q_g[neg_mask]                   # [Q]
+#         q_pos_scaled = q_g_scaled[pos_mask]     # [P]
+#         q_neg_scaled = q_g_scaled[neg_mask]     # [Q]
+
+#         if q_pos.numel() == 0 or q_neg.numel() == 0:
+#             continue
+
+#         # --------------------------------------------------------
+#         # Direct BT / DPO loss for all positive-negative pairs
+#         # --------------------------------------------------------
+#         diff = q_pos[:, None] - q_neg[None, :]               # [P, Q]
+#         pair_loss = F.softplus(-beta * diff)                 # [P, Q]
+#         uid_direct_losses.append(pair_loss.mean())
+
+#         # --------------------------------------------------------
+#         # Implicit surrogate term
+#         #
+#         # Appendix DPO correction structure:
+#         #   (+ trajectory term) + (- trajectory term) - 2 * group baseline
+#         #
+#         # We build a scalar surrogate with the same structure.
+#         # Since your direct loss uses sequence scores q_seq, we use the
+#         # beta-scaled sequence scores consistently here as requested.
+#         # --------------------------------------------------------
+#         group_mean_scaled = q_g_scaled.mean()                # scalar
+
+#         # scalar surrogate for each positive-negative pair
+#         # shape [P, Q]
+#         implicit_scalar_pairs = (
+#             q_pos_scaled[:, None]
+#             + q_neg_scaled[None, :]
+#             - 2.0 * group_mean_scaled
+#         )
+
+#         # detach pairwise direct loss coefficient
+#         uid_implicit_losses.append(
+#             (pair_loss.detach() * implicit_scalar_pairs).mean()
+#         )
+
+#     if len(uid_direct_losses) == 0:
+#         zero = q_seq.sum() * 0.0
+#         return zero, 0
+
+#     direct_bt_loss = torch.stack(uid_direct_losses).mean()
+#     implicit_bt_loss = torch.stack(uid_implicit_losses).mean()
+
+#     # same regularizer as your original code
+#     reg = lam * (q_seq ** 2).mean()
+#     total_loss = direct_bt_loss + lambda_indirect * implicit_bt_loss + reg
+#     return total_loss, len(uid_direct_losses)
+
 def compute_bt_hyper_loss_rm(
     token_level_scores,
     acc,
@@ -467,24 +582,10 @@ def compute_bt_hyper_loss_rm(
     response_mask,
     beta=0.05,
     lam=1e-3,
+    lambda_indirect=0.01,
+    debug_grad=False,
+    debug_prefix="[BT-HYPER]"
 ):
-    """
-    Full BT / DPO-style hyper-loss:
-      1) direct pairwise BT loss
-      2) implicit dependency term via surrogate loss
-
-    Args:
-        token_level_scores: [N, L]
-        acc:                [N]       binary success labels
-        uid:                [N]       prompt/group ids
-        response_mask:      [N, L]
-        beta:               scaling used in the direct pairwise loss and implicit surrogate
-        lam:                L2 regularizer coefficient
-
-    Returns:
-        total_loss: scalar
-        num_valid_uid_groups: int
-    """
     device = token_level_scores.device
     dtype = token_level_scores.dtype
 
@@ -492,15 +593,11 @@ def compute_bt_hyper_loss_rm(
     acc = acc.to(device=device, dtype=dtype)
     uid = uid.to(device=device)
 
-    # ------------------------------------------------------------
-    # Per-trajectory sequence score
-    # ------------------------------------------------------------
-    lens = response_mask.sum(dim=-1).clamp_min(1.0)  # [N]
-    q_seq = (token_level_scores * response_mask).sum(dim=-1) / lens  # [N]
+    lens = response_mask.sum(dim=-1).clamp_min(1.0)
+    q_seq = (token_level_scores * response_mask).sum(dim=-1) / lens
 
-    # For implicit surrogate, use the same beta-scaled reward convention
     scaled_token_scores = beta * token_level_scores
-    scaled_q_seq = (scaled_token_scores * response_mask).sum(dim=-1) / lens  # [N]
+    scaled_q_seq = (scaled_token_scores * response_mask).sum(dim=-1) / lens
 
     uid_direct_losses = []
     uid_implicit_losses = []
@@ -510,56 +607,38 @@ def compute_bt_hyper_loss_rm(
     for u in unique_uid:
         idxs = (uid == u).nonzero(as_tuple=False).squeeze(-1)
 
-        q_g = q_seq[idxs]                 # [g]
-        q_g_scaled = scaled_q_seq[idxs]   # [g]
-        a_g = acc[idxs]                   # [g]
+        q_g = q_seq[idxs]
+        q_g_scaled = scaled_q_seq[idxs]
+        a_g = acc[idxs]
 
-        # center per-uid to remove offset freedom, matching your direct code
         q_g = q_g - q_g.mean()
         q_g_scaled = q_g_scaled - q_g_scaled.mean()
 
         pos_mask = a_g > 0.5
         neg_mask = ~pos_mask
 
-        q_pos = q_g[pos_mask]                   # [P]
-        q_neg = q_g[neg_mask]                   # [Q]
-        q_pos_scaled = q_g_scaled[pos_mask]     # [P]
-        q_neg_scaled = q_g_scaled[neg_mask]     # [Q]
+        q_pos = q_g[pos_mask]
+        q_neg = q_g[neg_mask]
+        q_pos_scaled = q_g_scaled[pos_mask]
+        q_neg_scaled = q_g_scaled[neg_mask]
 
         if q_pos.numel() == 0 or q_neg.numel() == 0:
             continue
 
-        # --------------------------------------------------------
-        # Direct BT / DPO loss for all positive-negative pairs
-        # --------------------------------------------------------
-        diff = q_pos[:, None] - q_neg[None, :]               # [P, Q]
-        pair_loss = F.softplus(-beta * diff)                 # [P, Q]
+        diff = q_pos[:, None] - q_neg[None, :]
+        pair_loss = F.softplus(-beta * diff)
         uid_direct_losses.append(pair_loss.mean())
 
-        # --------------------------------------------------------
-        # Implicit surrogate term
-        #
-        # Appendix DPO correction structure:
-        #   (+ trajectory term) + (- trajectory term) - 2 * group baseline
-        #
-        # We build a scalar surrogate with the same structure.
-        # Since your direct loss uses sequence scores q_seq, we use the
-        # beta-scaled sequence scores consistently here as requested.
-        # --------------------------------------------------------
-        group_mean_scaled = q_g_scaled.mean()                # scalar
+        group_mean_scaled = q_g_scaled.mean()
 
-        # scalar surrogate for each positive-negative pair
-        # shape [P, Q]
         implicit_scalar_pairs = (
             q_pos_scaled[:, None]
             + q_neg_scaled[None, :]
             - 2.0 * group_mean_scaled
         )
 
-        # detach pairwise direct loss coefficient
-        uid_implicit_losses.append(
-            (pair_loss.detach() * implicit_scalar_pairs).mean()
-        )
+        implicit_loss = (pair_loss.detach() * implicit_scalar_pairs).mean()
+        uid_implicit_losses.append(implicit_loss)
 
     if len(uid_direct_losses) == 0:
         zero = q_seq.sum() * 0.0
@@ -567,11 +646,71 @@ def compute_bt_hyper_loss_rm(
 
     direct_bt_loss = torch.stack(uid_direct_losses).mean()
     implicit_bt_loss = torch.stack(uid_implicit_losses).mean()
-
-    # same regularizer as your original code
     reg = lam * (q_seq ** 2).mean()
-    lambda_indirect = 1e-2
+
     total_loss = direct_bt_loss + lambda_indirect * implicit_bt_loss + reg
+
+    if debug_grad:
+        direct_grad = torch.autograd.grad(
+            direct_bt_loss,
+            token_level_scores,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+
+        implicit_grad = torch.autograd.grad(
+            implicit_bt_loss,
+            token_level_scores,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+
+        weighted_implicit_grad = torch.autograd.grad(
+            lambda_indirect * implicit_bt_loss,
+            token_level_scores,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+
+        reg_grad = torch.autograd.grad(
+            reg,
+            token_level_scores,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+
+        def grad_norm(g):
+            if g is None:
+                return 0.0
+            return g.detach().norm().item()
+
+        direct_norm = grad_norm(direct_grad)
+        implicit_norm = grad_norm(implicit_grad)
+        weighted_implicit_norm = grad_norm(weighted_implicit_grad)
+        reg_norm = grad_norm(reg_grad)
+
+        ratio_raw = implicit_norm / (direct_norm + 1e-12)
+        ratio_weighted = weighted_implicit_norm / (direct_norm + 1e-12)
+
+        print(f"\n{debug_prefix} ===== DPO / BT hyper-loss debug =====")
+        print(f"{debug_prefix} direct_bt_loss:              {direct_bt_loss.detach().item():.8f}")
+        print(f"{debug_prefix} implicit_bt_loss:            {implicit_bt_loss.detach().item():.8f}")
+        print(f"{debug_prefix} lambda_indirect:             {lambda_indirect:.8f}")
+        print(f"{debug_prefix} lambda * implicit_bt_loss:   {(lambda_indirect * implicit_bt_loss).detach().item():.8f}")
+        print(f"{debug_prefix} reg:                         {reg.detach().item():.8f}")
+        print(f"{debug_prefix} total_loss:                  {total_loss.detach().item():.8f}")
+
+        print(f"{debug_prefix} --- gradient norms wrt token_level_scores ---")
+        print(f"{debug_prefix} ||grad direct||:             {direct_norm:.8e}")
+        print(f"{debug_prefix} ||grad implicit raw||:       {implicit_norm:.8e}")
+        print(f"{debug_prefix} ||grad lambda*implicit||:    {weighted_implicit_norm:.8e}")
+        print(f"{debug_prefix} ||grad reg||:                {reg_norm:.8e}")
+        print(f"{debug_prefix} raw implicit / direct:       {ratio_raw:.8e}")
+        print(f"{debug_prefix} weighted implicit / direct:  {ratio_weighted:.8e}")
+
+        suggested_lambda = direct_norm / (implicit_norm + 1e-12)
+        print(f"{debug_prefix} suggested lambda for equal grad norm: {suggested_lambda:.8e}")
+
     return total_loss, len(uid_direct_losses)
 
 ##############replay buffer version#############################

@@ -1,7 +1,7 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export DATA_DIR='data/nq_search'
 
-WAND_PROJECT='NQ-Search'
+WAND_PROJECT='NQ-Search-llama'
 
 # export BASE_MODEL='meta-llama/Llama-3.2-3B'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.2-3b-em
@@ -12,11 +12,11 @@ WAND_PROJECT='NQ-Search'
 # export BASE_MODEL='meta-llama/Llama-3.1-8B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.1-8b-it-em
 
-export BASE_MODEL='Qwen/Qwen2.5-3B'
-export EXPERIMENT_NAME=qwen-3b-ppo-OR
+# export BASE_MODEL='Qwen/Qwen2.5-3B'
+# export EXPERIMENT_NAME=qwen-3b-rloo-OR
 
-# export BASE_MODEL='meta-llama/Llama-3.1-8B'
-# export EXPERIMENT_NAME=search-grpo-outcome-reward-llama-8b-2turn
+export BASE_MODEL='meta-llama/Llama-3.1-8B'
+export EXPERIMENT_NAME=llama-grpo-OR
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B'
@@ -41,7 +41,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.max_start_length=2048 \
     data.max_obs_length=500 \
     data.shuffle_train_dataloader=True \
-    algorithm.adv_estimator=gae \
+    algorithm.adv_estimator=rloo \
     actor_rollout_ref.model.path=$BASE_MODEL \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.use_remove_padding=True \

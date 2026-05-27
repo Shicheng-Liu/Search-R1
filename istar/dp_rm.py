@@ -38,6 +38,24 @@ from verl.utils.ulysses import (gather_outpus_and_unpad,
 __all__ = ["DataParallelPRIMERewardModel"]
 
 
+def tensor_grad_norm_from_loss(loss, tensor, retain_graph=True):
+    grad = torch.autograd.grad(
+        loss,
+        tensor,
+        retain_graph=retain_graph,
+        allow_unused=True,
+    )[0]
+
+    if grad is None:
+        return 0.0, 0.0, 0.0
+
+    grad = grad.detach().float()
+    return (
+        grad.norm(2).item(),
+        grad.abs().mean().item(),
+        grad.abs().max().item(),
+    )
+
 def print_param_update(model, tag):
     with torch.no_grad():
         total_norm = 0.0
@@ -571,7 +589,7 @@ class DataParallelISTARRewardModel:
                 if self.config.model.loss_type == "ce":
                     dpo_loss = compute_ce_dpo_loss_rm(q, acc, response_mask=response_mask, beta=beta)
                 elif self.config.model.loss_type == "ce_full":
-                    dpo_loss = compute_ce_hyper_loss_rm(q, acc, response_mask=response_mask, beta=beta, m=self.config.micro_batch_size_per_gpu,uid=mb["uid"])
+                    dpo_loss = compute_ce_hyper_loss_rm(q, acc, response_mask=response_mask, beta=beta, m=self.config.micro_batch_size_per_gpu,uid=mb["uid"],lambda_indirect=self.config.lambda_indirect_ce,)
 
                 elif self.config.model.loss_type == "dpo":
                     dpo_loss, num_pairs = compute_bt_loss_rm(
@@ -590,6 +608,7 @@ class DataParallelISTARRewardModel:
                         uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
+                        lambda_indirect=self.config.lambda_indirect_dpo,
                     )
                     total_pairs += num_pairs 
 
@@ -600,6 +619,7 @@ class DataParallelISTARRewardModel:
                         response_mask=response_mask,
                         beta=beta,
                         m=self.config.micro_batch_size_per_gpu,
+                        lambda_indirect=self.config.lambda_indirect_ce,
                     )
 
                     bt_loss, num_valid_uid_groups = compute_bt_hyper_loss_rm(
@@ -608,6 +628,7 @@ class DataParallelISTARRewardModel:
                         uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
+                        lambda_indirect=self.config.lambda_indirect_dpo,
                     )
 
                     dpo_loss = ce_loss + self.config.lambda_dpo * bt_loss
@@ -1106,7 +1127,7 @@ class DataParallelPotentialRewardModel:
                 for i in range(B):
                     L = int(max_positions[i].item())
                     if L > 0:
-                        token_reward_process[i, : L - 1] = r_process[i, : L - 1]
+                        token_reward_process[i, : L] = r_process[i, : L]
             elif self.config.step_granularity == "step":
                 for i in range(B):
                     L = int(max_positions[i].item())
@@ -1277,6 +1298,9 @@ class DataParallelPotentialRewardModel:
                 # q_for_loss is already selected based on self.train_on_composite
                 if self.config.model.loss_type == "ce":
                     dpo_loss = compute_ce_dpo_loss_rm(q_for_loss, acc, response_mask=response_mask, beta=beta)
+                
+                elif self.config.model.loss_type == "ce_full":
+                    dpo_loss = compute_ce_hyper_loss_rm(q_for_loss, acc, response_mask=response_mask, beta=beta, m=self.config.micro_batch_size_per_gpu,uid=mb["uid"],lambda_indirect=self.config.lambda_indirect_ce,)
 
                 elif self.config.model.loss_type == "dpo":
                     dpo_loss, num_pairs = compute_bt_loss_rm(
@@ -1287,6 +1311,79 @@ class DataParallelPotentialRewardModel:
                         beta=beta,
                     )
                     total_pairs += num_pairs
+                
+                elif self.config.model.loss_type == "dpo_full":
+                    dpo_loss, num_pairs = compute_bt_hyper_loss_rm(
+                        token_level_scores=q_for_loss,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                        lambda_indirect=self.config.lambda_indirect_dpo,
+                    )
+                    total_pairs += num_pairs 
+
+                elif self.config.model.loss_type == "ce+dpo_full":
+                    ce_loss = compute_ce_hyper_loss_rm(
+                        token_level_scores=q_for_loss,
+                        acc=acc,
+                        response_mask=response_mask,
+                        beta=beta,
+                        m=self.config.micro_batch_size_per_gpu,
+                        lambda_indirect=self.config.lambda_indirect_ce,
+                    )
+
+                    # print("================================")
+                    # print("ce loss completed")
+                    # print("================================")
+
+                    bt_loss, num_valid_uid_groups = compute_bt_hyper_loss_rm(
+                        token_level_scores=q_for_loss,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                        lambda_indirect=self.config.lambda_indirect_dpo,
+                    )
+
+                    # print("================================")
+                    # print("dpo loss completed")
+                    # print("================================")
+
+                    dpo_loss = ce_loss + self.config.lambda_dpo * bt_loss
+                    total_pairs += num_valid_uid_groups 
+
+                    # ---------- debug scale ----------
+                    if getattr(self.config, "debug_lambda_dpo", False):
+                        ce_q_norm, ce_q_abs_mean, ce_q_abs_max = tensor_grad_norm_from_loss(
+                            ce_loss, q_for_loss, retain_graph=True
+                        )
+
+                        bt_q_norm, bt_q_abs_mean, bt_q_abs_max = tensor_grad_norm_from_loss(
+                            bt_loss, q_for_loss, retain_graph=True
+                        )
+
+                        grad_ratio = bt_q_norm / max(ce_q_norm, 1e-12)
+                        suggested_lambda = 1.0 / max(grad_ratio, 1e-12)
+
+                        print("\n========== LAMBDA_DPO DEBUG CHEAP ==========")
+                        print(f"ce_loss:                   {ce_loss.detach().item():.8f}")
+                        print(f"bt_loss:                   {bt_loss.detach().item():.8f}")
+                        print(f"lambda_dpo:                {self.config.lambda_dpo:.8g}")
+                        print(f"lambda_dpo * bt_loss:      {(self.config.lambda_dpo * bt_loss).detach().item():.8f}")
+
+                        print("\n--- Gradient wrt q_for_loss ---")
+                        print(f"CE dq norm:                {ce_q_norm:.8f}")
+                        print(f"BT dq norm:                {bt_q_norm:.8f}")
+                        print(f"lambda * BT dq norm:       {self.config.lambda_dpo * bt_q_norm:.8f}")
+                        print(f"BT / CE dq ratio:          {grad_ratio:.8f}")
+                        print(f"suggest lambda_dpo:        {suggested_lambda:.8g}")
+
+                        print("\n--- dq abs stats ---")
+                        print(f"CE dq abs mean/max:        {ce_q_abs_mean:.8e} / {ce_q_abs_max:.8e}")
+                        print(f"BT dq abs mean/max:        {bt_q_abs_mean:.8e} / {bt_q_abs_max:.8e}")
+                        print("===========================================\n")
+
 
                 elif self.config.model.loss_type == "ce+dpo":
                     l1 = compute_ce_dpo_loss_rm(q_for_loss, acc, response_mask=response_mask, beta=beta)
@@ -1364,12 +1461,16 @@ class DataParallelPotentialRewardModel:
                 else:
                     loss = dpo_loss / grad_denom
 
+               
+                # print_param_update(self.reward_module, "before backward")
                 loss.backward()
-
+            # print_param_update(self.reward_module, "after backward")
             grad_norm = self._optimizer_step()
             append_to_dict(metrics, {"reward_model/grad_norm": float(grad_norm.detach().item())})
-
+        # print_param_update(self.reward_module, "after step")
+        # input()
         self.reward_optimizer.zero_grad()
+
 
         # <<< CHANGED: handle empty replay (no batches processed) safely
         if len(total_reward_lst) == 0:
@@ -1788,37 +1889,108 @@ class DataParallelLMHeadISTARRewardModel:
                 q_lst.append(q.detach())
 
                 if self.config.model.loss_type == "ce":
-                    loss_val = compute_ce_dpo_loss_rm(q, acc, response_mask=response_mask, beta=beta)
+                    dpo_loss = compute_ce_dpo_loss_rm(q, acc, response_mask=response_mask, beta=beta)
+                elif self.config.model.loss_type == "ce_full":
+                    dpo_loss = compute_ce_hyper_loss_rm(q, acc, response_mask=response_mask, beta=beta, m=self.config.micro_batch_size_per_gpu,uid=mb["uid"],lambda_indirect=self.config.lambda_indirect_ce,)
 
                 elif self.config.model.loss_type == "dpo":
-                    loss_val, _num_pairs = compute_bt_loss_rm(
+                    dpo_loss, num_pairs = compute_bt_loss_rm(
                         token_level_scores=q,
                         acc=acc,
                         uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
                     )
+                    total_pairs += num_pairs
+                
+                elif self.config.model.loss_type == "dpo_full":
+                    dpo_loss, num_pairs = compute_bt_hyper_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                        lambda_indirect=self.config.lambda_indirect_dpo,
+                    )
+                    total_pairs += num_pairs 
+
+                elif self.config.model.loss_type == "ce+dpo_full":
+                    ce_loss = compute_ce_hyper_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        response_mask=response_mask,
+                        beta=beta,
+                        m=self.config.micro_batch_size_per_gpu,
+                        lambda_indirect=self.config.lambda_indirect_ce,
+                    )
+
+                    bt_loss, num_valid_uid_groups = compute_bt_hyper_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                        lambda_indirect=self.config.lambda_indirect_dpo,
+                    )
+
+                    dpo_loss = ce_loss + self.config.lambda_dpo * bt_loss
+                    total_pairs += num_valid_uid_groups 
+
+                
+
+                elif self.config.model.loss_type == "ce+dpo":
+                    dpo_loss_1 = compute_ce_dpo_loss_rm(q, acc, response_mask=response_mask, beta=beta)
+                    dpo_loss_2, num_pairs = compute_bt_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                    )
+                    dpo_loss = dpo_loss_1 + self.config.lambda_dpo * dpo_loss_2
+                    total_pairs += num_pairs
 
                 elif self.config.model.loss_type == "irl":
-                    loss_val, _num_pairs = compute_irl_loss_rm(
+                    dpo_loss, num_pairs = compute_irl_loss_rm(
                         token_level_scores=q,
                         acc=acc,
                         uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
                     )
+                    total_pairs += num_pairs
+
+                elif self.config.model.loss_type == "irl+dpo":
+                    dpo_loss_1, num_pairs = compute_irl_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                    )
+                    total_pairs += num_pairs
+
+                    dpo_loss_2, num_pairs = compute_bt_loss_rm(
+                        token_level_scores=q,
+                        acc=acc,
+                        uid=mb["uid"],
+                        response_mask=response_mask,
+                        beta=beta,
+                    )
+                    dpo_loss = 0.5 * dpo_loss_1 + 0.5 * dpo_loss_2
 
                 elif self.config.model.loss_type == "composite":
-                    loss_val, _num_pairs = composite_rm_loss(
+                    dpo_loss, additional_metric = composite_rm_loss(
                         token_level_scores=q,
                         acc=acc,
                         uid=mb["uid"],
                         response_mask=response_mask,
                         beta=beta,
                     )
+                    metrics.update(additional_metric)
 
                 elif self.config.model.loss_type == "bon_acc":
-                    loss_val = compute_detach_dpo_loss_rm(
+                    dpo_loss = compute_detach_dpo_loss_rm(
                         q,
                         acc,
                         Q_bc=mb["Q_bc"],
@@ -1829,7 +2001,7 @@ class DataParallelLMHeadISTARRewardModel:
                     )
 
                 elif self.config.model.loss_type == "bon_rm":
-                    loss_val = compute_detach_dpo_loss_rm(
+                    dpo_loss = compute_detach_dpo_loss_rm(
                         q,
                         acc,
                         Q_bc=mb["Q_bc"],
@@ -1841,13 +2013,13 @@ class DataParallelLMHeadISTARRewardModel:
                 else:
                     raise NotImplementedError
 
-                append_to_dict(metrics, {"reward_model/dpo_loss": float(loss_val.detach().item())})
+                append_to_dict(metrics, {"reward_model/dpo_loss": float(dpo_loss.detach().item())})
 
                 if self.config.use_dynamic_bsz:
                     mbsz = attention_mask.shape[0]
-                    loss = loss_val * (mbsz / self.config.ppo_mini_batch_size)
+                    loss = dpo_loss * (mbsz / self.config.ppo_mini_batch_size)
                 else:
-                    loss = loss_val / self.gradient_accumulation
+                    loss = dpo_loss / self.gradient_accumulation
 
                 loss.backward()
 

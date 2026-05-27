@@ -1,7 +1,7 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export DATA_DIR='data/nq_hotpotqa_train'
+export DATA_DIR='data/nq_search'
 
-WAND_PROJECT='Search-R1-curve-hotpot'
+WAND_PROJECT='NQ-Search'
 
 # export BASE_MODEL='meta-llama/Llama-3.2-3B'
 # export EXPERIMENT_NAME=nq-search-r1-ppo-llama3.2-3b-em
@@ -13,7 +13,7 @@ WAND_PROJECT='Search-R1-curve-hotpot'
 # export EXPERIMENT_NAME=nq-search-r1-ppo-llama3.1-8b-it-em
 
 export BASE_MODEL='Qwen/Qwen2.5-3B'
-export EXPERIMENT_NAME=hotpotqa-search-r1-ppo-qwen2.5-3b-gae_4turn
+export EXPERIMENT_NAME=qwen-3b-ppo-OR
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-ppo-qwen2.5-3b-it-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B'
@@ -28,7 +28,7 @@ export VLLM_ATTENTION_BACKEND=XFORMERS # vllm + qwen2-7b with flash_attn has som
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
-    data.val_files=$DATA_DIR/test_3000.parquet \
+    data.val_files=$DATA_DIR/test.parquet \
     data.train_data_num=null \
     data.val_data_num=null \
     data.train_batch_size=512 \
@@ -76,15 +76,15 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
+    trainer.save_freq=500 \
     trainer.test_freq=50 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.total_epochs=15 \
-    trainer.total_training_steps=500 \
+    trainer.total_training_steps=501 \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
-    max_turns=4 \
+    max_turns=2 \
     retriever.url="http://127.0.0.1:8000/retrieve" \
     retriever.topk=3 \
     2>&1 | tee $EXPERIMENT_NAME.log

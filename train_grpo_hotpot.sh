@@ -1,7 +1,7 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export DATA_DIR='data/nq_hotpotqa_train'
 
-WAND_PROJECT='Search-R1-curve-hotpot'
+WAND_PROJECT='NQ-HotpotQA'
 
 # export BASE_MODEL='meta-llama/Llama-3.2-3B'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.2-3b-em
@@ -13,7 +13,7 @@ WAND_PROJECT='Search-R1-curve-hotpot'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.1-8b-it-em
 
 export BASE_MODEL='Qwen/Qwen2.5-3B'
-export EXPERIMENT_NAME=hotpot-grpo-outcome-reward-qwen-3b-4turn
+export EXPERIMENT_NAME=qwen-3b-grpo-OR
 
 # export BASE_MODEL='meta-llama/Llama-3.1-8B'
 # export EXPERIMENT_NAME=hotpot-grpo-outcome-reward-llama-8b-4turn
@@ -72,12 +72,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
+    trainer.save_freq=450 \
     trainer.test_freq=50 \
     trainer.project_name=$WAND_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.total_epochs=15 \
-    trainer.total_training_steps=500 \
+    trainer.total_training_steps=460 \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
     max_turns=4 \
